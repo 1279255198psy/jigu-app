@@ -102,8 +102,22 @@ jobs:
             Select-Object -First 40 |
             ForEach-Object { Write-Host ("  " + $_.FullName.Substring($tmp.Length + 1)) }
 
-          Copy-Item (Join-Path $tmp 'lib\net45\Microsoft.Web.WebView2.Core.dll')     $lib -Force
-          Copy-Item (Join-Path $tmp 'lib\net45\Microsoft.Web.WebView2.WinForms.dll') $lib -Force
+          # Do NOT hardcode the target-framework folder. The package has shipped lib\net45,
+          # lib\net462 and others over time, and 1.0.4258.31 has ONLY lib\net462 -- a
+          # hardcoded lib\net45 is exactly what broke the v0.2.0 build. Search for the file
+          # instead, preferring the classic .NET Framework build (net4x) over the
+          # netcore/lib_manual ones, newest net4x first.
+          function Find-Sdk([string]$name) {
+            $cands = @(Get-ChildItem (Join-Path $tmp 'lib') -Recurse -File -Filter $name -ErrorAction SilentlyContinue)
+            if ($cands.Count -eq 0) { throw ("$name is not under lib\ in the SDK package -- see the listing above") }
+            $net4 = @($cands | Where-Object { $_.Directory.Name -match '^net4\d' } |
+                      Sort-Object { [int]($_.Directory.Name -replace '\D','') } -Descending)
+            if ($net4.Count -gt 0) { return $net4[0].FullName }
+            return $cands[0].FullName
+          }
+
+          Copy-Item (Find-Sdk 'Microsoft.Web.WebView2.Core.dll')     $lib -Force
+          Copy-Item (Find-Sdk 'Microsoft.Web.WebView2.WinForms.dll') $lib -Force
 
           $loader = @(
             (Join-Path $tmp 'runtimes\win-x64\native\WebView2Loader.dll'),
