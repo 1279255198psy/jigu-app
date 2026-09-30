@@ -228,7 +228,7 @@ jobs:
           cp "$ZIP"   "release/jigu-portable-$TAG.zip"
           cp "$SETUP" "release/jigu-installer-$TAG.exe"
           # 语料通道：清单与三个数据文件跟着同一个 Release 走。默认更新源是
-          # github:rdfghjgyuytytrudthgc/jigu-app，所以程序本体和语料两条通道
+          # github:1279255198psy/jigu-app，所以程序本体和语料两条通道
           # 都不需要额外配置任何服务器。
           # upload-artifact 会按公共父目录保留层级（这四个文件落在 update/ 下），
           # 但那是它的实现细节，用 find 兜住；后面逐个检查，漏挂一定报错。

@@ -137,7 +137,7 @@ WebView2Loader.dll
 | `data_version.json` | 史料数据清单（由 `build.ps1` 生成） |
 | `corpus.json` · `labels.json` · `stopwords.json` | 史料与两张表，供数据通道增量下发 |
 
-后五个文件是给**自动更新**用的。默认更新源是 `github:rdfghjgyuytytrudthgc/jigu-app`，
+后五个文件是给**自动更新**用的。默认更新源是 `github:1279255198psy/jigu-app`，
 它读的就是「最新 Release」的附件，所以这几个文件挂上去之后，程序本体与史料两条通道
 都零配置可用 —— 用户端不需要任何设置。
 

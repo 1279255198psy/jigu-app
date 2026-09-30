@@ -327,7 +327,7 @@ dist\稽古\               绿色版目录
   ├─ 稽古.exe            主程序（界面内嵌）
   ├─ corpus.json         外置史料（201 条，可被增量更新替换）
   ├─ data_version.json   本地数据版本清单
-  ├─ update_base.txt     程序更新源（默认 github:rdfghjgyuytytrudthgc/jigu-app）
+  ├─ update_base.txt     程序更新源（默认 github:1279255198psy/jigu-app）
   ├─ data_base.txt       史料数据更新源（不配则跟随程序更新源）
   └─ data\               初始按史书分卷的 JSON（便于对照/编辑）
 dist\update\             更新通道产物（清单 + 语料 + 安装包副本，整个目录可直接上传）
@@ -358,7 +358,7 @@ docs\更新服务托管说明.md   开发者布署更新文件的完整说明
 
 见 `docs\更新服务托管说明.md`，要点：
 
-1. **默认什么都不用配**：更新源是 `github:rdfghjgyuytytrudthgc/jigu-app`，读的是最新
+1. **默认什么都不用配**：更新源是 `github:1279255198psy/jigu-app`，读的是最新
    Release 的附件。打一个 tag（用 `tools\release.ps1`，见第七节），CI 就会把
    `app_version.json`、`data_version.json`、
    `corpus.json`、`labels.json`、`stopwords.json` 一起挂上去，程序本体与史料两条通道

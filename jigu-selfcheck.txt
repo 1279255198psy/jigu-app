@@ -1,5 +1,5 @@
 == 稽古 自检 ==
-版本     : v0.2.1
+版本     : v0.3.1
 系统     : Windows 10.0.26200(Win11) / x64 / .NET 4.0.30319.42000
 程序目录 : D:\DSH\jigu-app_new\jigu-app\dist\稽古\
 WebView2 : 已安装 registry:154.0.4258.37
@@ -61,6 +61,6 @@ web 资源 : 9 项
 --- 5. 更新清单 ---
 data_version.json : 存在
 app_version.json  : 缺失（将静默检查远端）
-更新地址          : github:rdfghjgyuytytrudthgc/jigu-app
+更新地址          : github:1279255198psy/jigu-app
 
 RESULT: SELFCHECK OK (0 fails)

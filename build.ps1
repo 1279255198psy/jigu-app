@@ -313,7 +313,7 @@ $stopHash = (Get-FileHash -LiteralPath $stopPath -Algorithm SHA256).Hash.ToLower
 $dv = [ordered]@{
   version = $version
   generated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-  source_url = "https://github.com/rdfghjgyuytytrudthgc/jigu-app"
+  source_url = "https://github.com/1279255198psy/jigu-app"
   books = [ordered]@{ corpus = $corpusHash }
   files = [ordered]@{ "labels.json" = $synHash; "stopwords.json" = $stopHash }
   paths = [ordered]@{ corpus = "corpus.json"; "labels.json" = "labels.json"; "stopwords.json" = "stopwords.json" }
@@ -400,10 +400,10 @@ Copy-Item "$root\resources\app.ico" (Join-Path $appDir $iconName) -Force
 # target directory, so a distributor's or user's custom source survives auto-updates.
 $updateSrc = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText((Join-Path $appDir "update_base.txt"),
-  "github:rdfghjgyuytytrudthgc/jigu-app", $updateSrc)
+  "github:1279255198psy/jigu-app", $updateSrc)
 # data_base.txt overrides the data channel only; same value here means "follow the app source".
 [System.IO.File]::WriteAllText((Join-Path $appDir "data_base.txt"),
-  "github:rdfghjgyuytytrudthgc/jigu-app", $updateSrc)
+  "github:1279255198psy/jigu-app", $updateSrc)
 # ---- Stage the history shards: <appDir>\corpus\* ----
 # Produced by tools/convert-24histories (see build\corpus). They are NOT part of the base64
 # payload: a string literal round-trips through UTF-16 in the assembly, so base64 costs 2.67x

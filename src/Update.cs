@@ -92,7 +92,7 @@ namespace Jigu
     {
         public const string GitHubPrefix = "github:";
         /// <summary>默认从发布仓库的 Release 抓，不再依赖任何需要手工上传的静态目录</summary>
-        public const string DefaultAppSpec = "github:rdfghjgyuytytrudthgc/jigu-app";
+        public const string DefaultAppSpec = "github:1279255198psy/jigu-app";
         public const string DefaultApiBase = "https://api.github.com";
 
         /// <summary>
@@ -1012,7 +1012,7 @@ namespace Jigu
                 StringBuilder sb = new StringBuilder(512);
                 sb.Append("{\n  \"version\": \"").Append(Json.Escape(version)).Append("\",\n");
                 sb.Append("  \"generated_at\": \"").Append(DateTime.UtcNow.ToString("s")).Append("\",\n");
-                sb.Append("  \"source_url\": \"https://github.com/rdfghjgyuytytrudthgc/jigu-app\",\n");
+                sb.Append("  \"source_url\": \"https://github.com/1279255198psy/jigu-app\",\n");
                 sb.Append("  \"books\": { \"corpus\": \"").Append(hash).Append("\" },\n");
                 if (hasSyn)
                     sb.Append("  \"files\": { \"").Append(LabelTable.FileName).Append("\": \"")
