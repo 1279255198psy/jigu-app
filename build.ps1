@@ -25,7 +25,7 @@ $dist = Join-Path $root "dist"
 # installer via src\Version.g.cs (generated just below), so bumping this one line is all
 # it takes -- AppVer.Number and SetupInfo.Version derive from it and must not be edited.
 # Keep the line byte-identical: release.yml and tools\release.ps1 both regex it.
-$version = "0.2.0"
+$version = "0.2.1"
 
 # The icon file name carries the version on purpose: Windows caches icons by path, so a
 # new version needs a new path or the user keeps seeing the old artwork. This string must
