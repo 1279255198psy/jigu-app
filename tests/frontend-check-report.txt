@@ -1,9 +1,0 @@
-﻿OK   app.js  20313 bytes
-OK   index.html  4637 bytes
-OK   styles.css  14250 bytes
-OK   ink.css  3286 bytes
-OK   brace balanced
-OK   paren balanced
-OK   bracket balanced
-
-RESULT: FRONTEND OK (0 fails)
