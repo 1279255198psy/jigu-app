@@ -6,12 +6,19 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Text;
 
 namespace Jigu
 {
     internal static partial class InstallerPayload
     {
+        /// <summary>史书分片资源的清单资源名（由 build.ps1 的 /resource: 装入）</summary>
+        public const string ShardResourceName = "Jigu.corpus.shards.zip";
+
+        /// <summary>分片落地的目录名，与 Library.DirName 一致</summary>
+        private const string ShardDirName = "corpus";
+
         /// <summary>
         /// 解压时要保留、不覆盖的文件（目标目录里已存在则跳过）。
         /// 更新源配置是「分发方或用户自己改的」，默认值在编译内（Net/UpdateSource），
@@ -98,6 +105,65 @@ namespace Jigu
             }
             if (failed > 0)
                 Log.Write("ExtractTo: 写入 " + n + " 个，失败 " + failed + " 个（目标 " + destDir + "）");
+
+            ExtractShards(destDir);
+            return n;
+        }
+
+        /// <summary>
+        /// 把随包的分片 zip 解到 destDir\corpus\，返回写出的文件数。
+        ///
+        /// 分片刻意不走上面那张 base64 表：负载的每一项都是 C# 字符串字面量，而程序集把
+        /// 字面量按 UTF-16 存放，于是 base64 之后再翻一倍 —— 实测放大 2.67×。二十兆的分片
+        /// 会胀成五十多兆，还要 csc 去解析一个几十兆的 .cs。走 /resource: 的原始二进制既
+        /// 只按 deflate 后的体积算，也不用编译器碰它。
+        ///
+        /// 装配里没有这个资源时（主程序、或还没带分片的旧安装包）静默返回 0：分片缺席
+        /// 不该让整次安装判为失败，主程序本来就能只靠精选集跑。
+        /// </summary>
+        public static int ExtractShards(string destDir)
+        {
+            if (string.IsNullOrEmpty(destDir)) return 0;
+            int n = 0;
+            try
+            {
+                Stream res = typeof(InstallerPayload).Assembly
+                    .GetManifestResourceStream(ShardResourceName);
+                if (res == null) return 0;
+                using (res)
+                using (ZipArchive zip = new ZipArchive(res, ZipArchiveMode.Read))
+                {
+                    string root = Path.Combine(destDir, ShardDirName);
+                    foreach (ZipArchiveEntry e in zip.Entries)
+                    {
+                        try
+                        {
+                            string name = e.FullName.Replace('\\', '/');
+                            if (name.EndsWith("/", StringComparison.Ordinal)) continue;
+                            // 与 ExtractTo 同一条规矩：负载键是构建期生成的，但绝不允许越出目标目录
+                            if (name.IndexOf("..", StringComparison.Ordinal) >= 0 || name.StartsWith("/"))
+                            {
+                                Log.Write("ExtractShards 拒绝越界条目: " + name);
+                                continue;
+                            }
+                            string path = Path.Combine(root, name.Replace('/', Path.DirectorySeparatorChar));
+                            string dir = Path.GetDirectoryName(path);
+                            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                            using (Stream src = e.Open())
+                            using (FileStream dst = new FileStream(path, FileMode.Create, FileAccess.Write))
+                                src.CopyTo(dst);
+                            n++;
+                        }
+                        catch (Exception ex) { Log.Error("ExtractShards " + e.FullName, ex); }
+                    }
+                }
+                Log.Write("ExtractShards: 写出 " + n + " 个分片文件（目标 " + Path.Combine(destDir, ShardDirName) + "）");
+            }
+            catch (Exception ex)
+            {
+                // 磁盘满、zip 损坏：分片解不出来不该连累已经落地的程序
+                Log.Error("ExtractShards 解压失败", ex);
+            }
             return n;
         }
     }

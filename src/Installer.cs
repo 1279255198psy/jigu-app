@@ -170,6 +170,8 @@ namespace JiguSetup
                 done++;
                 if (onFile != null) onFile(done, total, rel);
             }
+            // 史书分片走 /resource: 的 zip，不在这张表里，单独解到 corpus\
+            InstallerPayload.ExtractShards(targetDir);
             return done;
         }
 
@@ -779,6 +781,46 @@ namespace JiguSetup
             catch { return false; }
         }
 
+        /// <summary>
+        /// corpus\ 里的东西：随包分发的史书分片 —— 一份清单 index.json 加各 <slug>.json。
+        /// 它不在负载表里（分片走 /resource: 的 zip，不走 base64 表），所以是单独认的一类，
+        /// 与 pending\ 同理。只认「清单里确实列到的 slug」，用户在 corpus\ 里自己放的文件
+        /// 一律不认 —— 拿不准就不删，这是这个文件里一贯的规矩。
+        /// </summary>
+        /// <param name="installDir">安装目录本身（不是 corpus\ 子目录）——清单在
+        /// <installDir>\corpus\index.json，传错了就永远读不出书目。</param>
+        private static bool IsOnlyCorpusRecursive(string installDir)
+        {
+            string dir = Path.Combine(installDir, Library.DirName);
+            HashSet<string> have = CorpusSlugs(installDir);
+            if (have.Count == 0) return false;      // 清单读不出来就当作不是我们的
+            try
+            {
+                foreach (string f in Directory.GetFiles(dir))
+                {
+                    string n = Path.GetFileName(f);
+                    if (string.Equals(n, Library.ManifestName, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (n.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+                        && have.Contains(n.Substring(0, n.Length - 5))) continue;
+                    return false;
+                }
+                return Directory.GetDirectories(dir).Length == 0;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>清单里列到的分片 slug。清单缺失（旧版本装的）时返回空集。</summary>
+        private static HashSet<string> CorpusSlugs(string dir)
+        {
+            HashSet<string> set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (Library.Book b in Library.Available(dir)) set.Add(b.Slug);
+            }
+            catch { }
+            return set;
+        }
+
         /// <summary>把绝对路径换算成与 OurFileNames() 同一套键（相对安装目录、正斜杠分隔）。</summary>
         private static string RelKey(string root, string fullPath)
         {
@@ -830,6 +872,10 @@ namespace JiguSetup
                     {
                         if (!IsOnlyPendingRecursive(d)) return false;
                     }
+                    else if (string.Equals(n, Library.DirName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!IsOnlyCorpusRecursive(dir)) return false;
+                    }
                     else if (HasKeyUnder(ours, n))
                     {
                         if (!IsOnlyOursRecursive(d, dir, ours)) return false;
@@ -873,6 +919,12 @@ namespace JiguSetup
                 if (Directory.Exists(pending) && IsOnlyPendingRecursive(pending))
                 {
                     try { Directory.Delete(pending, true); } catch { }
+                }
+                // 史书分片同样归我们：它是随安装包解出来的，留着就是上百兆的残留
+                string corpus = Path.Combine(dir, Library.DirName);
+                if (Directory.Exists(corpus) && IsOnlyCorpusRecursive(dir))
+                {
+                    try { Directory.Delete(corpus, true); } catch { }
                 }
             }
             catch { }

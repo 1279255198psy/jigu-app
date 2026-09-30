@@ -21,6 +21,7 @@ echo "source files: $n"
 FLAGS="-nologo -target:winexe -platform:anycpu -optimize+ -utf8output
   -reference:System.dll -reference:System.Core.dll -reference:System.Drawing.dll
   -reference:System.Windows.Forms.dll -reference:System.Net.dll -reference:System.Security.dll
+  -reference:System.IO.Compression.dll
   -reference:tests/Microsoft.Web.WebView2.Core.dll
   -reference:tests/Microsoft.Web.WebView2.WinForms.dll"
 

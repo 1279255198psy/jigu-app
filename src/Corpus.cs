@@ -106,6 +106,15 @@ namespace Jigu
         /// <summary>从 exe 同目录加载语料；不存在则回落到内置种子。同义词表与停用词表一并加载。</summary>
         public void LoadFrom(string baseDir)
         {
+            LoadFrom(baseDir, null);
+        }
+
+        /// <summary>
+        /// 加载精选语料，再按需追加史书分片。分片是「全塞进安装包、按需加载」的那一半：
+        /// 只把勾选的几部读进来，没勾的不占运行内存也不占启动时间。
+        /// </summary>
+        public void LoadFrom(string baseDir, IList<string> shardPaths)
+        {
             _labels = LabelTable.Load(baseDir);
             _stop = StopWords.Load(baseDir);
             string path = Path.Combine(baseDir, DataFileName);
@@ -114,8 +123,10 @@ namespace Jigu
                 try
                 {
                     LoadFile(path);
+                    if (shardPaths != null && shardPaths.Count > 0) AppendFiles(shardPaths);
                     Log.Write("corpus loaded: " + _docs.Count + " docs, " + _index.Count
-                        + " terms, index≈" + (_docs.Count == 0 ? 0 : IndexBytes / 1024) + " KB, file=" + path);
+                        + " terms, index≈" + (_docs.Count == 0 ? 0 : IndexBytes / 1024) + " KB, file=" + path
+                        + (shardPaths != null && shardPaths.Count > 0 ? ", shards=" + shardPaths.Count : ""));
                     return;
                 }
                 catch (Exception ex)
@@ -128,6 +139,32 @@ namespace Jigu
                 Log.Write("corpus file not found: " + path + " -> using embedded seed");
             }
             LoadEmbedded();
+        }
+
+        /// <summary>追加若干分片文件，不清空已有语料。单份失败只记日志，不影响其余。</summary>
+        public void AppendFiles(IList<string> paths)
+        {
+            foreach (string p in paths)
+            {
+                if (string.IsNullOrEmpty(p) || !File.Exists(p)) continue;
+                try { AppendFile(p); }
+                catch (Exception ex) { Log.Error("shard load failed: " + p, ex); }
+            }
+        }
+
+        /// <summary>把一份语料 JSON 追加进现有索引；文档号接着已有文档往下排。</summary>
+        public void AppendFile(string path)
+        {
+            byte[] bytes = File.ReadAllBytes(path);
+            lock (_gate)
+            {
+                JsonScan.ForEachDocument(bytes, delegate(CorpusDoc doc, long start, long end)
+                {
+                    doc.No = _docs.Count;
+                    _docs.Add(doc);
+                    IndexDoc(doc);
+                });
+            }
         }
 
         /// <summary>加载一个语料 JSON 文件</summary>

@@ -174,6 +174,11 @@
       return Promise.resolve({ normalized: q, terms: Object.keys(t) });
     }
     if (name === "CorpusStats") return localStats();
+    // 离线（页面被系统浏览器直接打开）时没有分册概念：只说「没装」，不要编一份书目出来
+    if (name === "GetLibrary") return Promise.resolve({ installed: false, books: [] });
+    if (name === "SetLibrarySelection") {
+      return Promise.resolve({ ok: false, error: "离线模式不能加载史书分册。" });
+    }
     if (name === "ConsumeDataUpdated") return Promise.resolve(false);
     // 离线（页面被系统浏览器直接打开）时本机没有更新服务：如实回答，不要假装"已就绪"
     if (name === "GetUpdateState") return Promise.resolve({ ready: false, phase: "idle", snoozed: false });
@@ -417,9 +422,171 @@
       box.appendChild(el("p", "hint", "史料文件：" + (stats.source || "—")));
     }
   }
+  // 「装了」与「加载了」是两件事：分册随安装包装好（离线可用），但只有勾选的才读进内存。
+  // 这一段是唯一会改动内存占用的界面 —— 应用一次等于重建索引，所以要显式的按钮 + 忙碌态，
+  // 不能每勾一下就重载。
+  var SEL_PAGE = 20, selPage = 0;
+  // 实测：史记 5.06 MB 分册 -> 索引 97.4 MB；前四史 20.05 MB -> 330.1 MB。
+  // 16–19 倍，随各书用词重合度浮动，所以界面上的数字一律标「约」。
+  var RAM_PER_BYTE = 19;
+
+  function fmtMB(bytes) {
+    var b = Number(bytes) || 0;
+    return (Math.round(b * 10 / 1048576) / 10) + " MB";
+  }
+
+  function renderShards(lib) {
+    var box = $("shards");
+    if (!box) return;
+    box.textContent = "";
+    if (!lib || !lib.installed || !(lib.books || []).length) {
+      box.appendChild(el("p", "hint", "本次安装未附带史书分册，检索只用精选史料。"));
+      return;
+    }
+
+    var books = lib.books;
+    var pending = {};
+    var i;
+    for (i = 0; i < books.length; i++) if (books[i].selected) pending[books[i].slug] = 1;
+
+    box.appendChild(el("h2", "sec-title", "史书分册"));
+    box.appendChild(el("p", "hint", "分册已随程序装好，勾选后才读进内存，取消即释放。"
+      + "全量索引约 1.4 GB，按需选择。"));
+
+    var table = el("table", "books");
+    var hr = el("tr");
+    hr.appendChild(el("th", null, "选"));
+    hr.appendChild(el("th", null, "史书"));
+    hr.appendChild(el("th", null, "朝代"));
+    hr.appendChild(el("th", null, "条数"));
+    hr.appendChild(el("th", null, "文件"));
+    hr.appendChild(el("th", null, "译文"));
+    var thead = el("thead");
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    var pages = Math.max(1, Math.ceil(books.length / SEL_PAGE));
+    if (selPage >= pages) selPage = pages - 1;
+    if (selPage < 0) selPage = 0;
+    var tbody = el("tbody");
+    var from = selPage * SEL_PAGE, to = Math.min(books.length, from + SEL_PAGE);
+    var boxes = [];
+    for (i = from; i < to; i++) {
+      (function (b) {
+        var tr = el("tr");
+        var td0 = el("td");
+        var cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !!pending[b.slug];
+        cb.onchange = function () {
+          if (cb.checked) pending[b.slug] = 1; else delete pending[b.slug];
+          summary();
+        };
+        boxes.push({ slug: b.slug, box: cb });
+        td0.appendChild(cb);
+        tr.appendChild(td0);
+        tr.appendChild(el("td", null, b.book));
+        tr.appendChild(el("td", null, b.dynasty));
+        tr.appendChild(el("td", null, String(b.docs)));
+        tr.appendChild(el("td", null, fmtMB(b.bytes)));
+        tr.appendChild(el("td", null, b.pairing));
+        tbody.appendChild(tr);
+      })(books[i]);
+    }
+    table.appendChild(tbody);
+    box.appendChild(table);
+
+    if (pages > 1) {
+      var pager = el("div", "pager");
+      var prev = el("button", "ghost", "上一页"), next = el("button", "ghost", "下一页");
+      prev.disabled = selPage <= 0;
+      next.disabled = selPage >= pages - 1;
+      prev.onclick = function () { selPage--; renderShards(lib); };
+      next.onclick = function () { selPage++; renderShards(lib); };
+      pager.appendChild(prev);
+      pager.appendChild(el("span", "hint", " " + (selPage + 1) + " / " + pages + " "));
+      pager.appendChild(next);
+      box.appendChild(pager);
+    }
+
+    var row = el("div", "row");
+    var all = el("button", "ghost", "全选"), none = el("button", "ghost", "全不选");
+    var apply = el("button", "seal-btn", "应用勾选");
+    var info = el("span", "hint");
+    all.onclick = function () {
+      pending = {};
+      for (i = 0; i < books.length; i++) pending[books[i].slug] = 1;
+      for (i = 0; i < boxes.length; i++) boxes[i].box.checked = true;
+      summary();
+    };
+    none.onclick = function () {
+      pending = {};
+      for (i = 0; i < boxes.length; i++) boxes[i].box.checked = false;
+      summary();
+    };
+    apply.onclick = function () { applySelection(lib, pending, apply); };
+    row.appendChild(all);
+    row.appendChild(none);
+    row.appendChild(apply);
+    row.appendChild(info);
+    box.appendChild(row);
+
+    box.appendChild(el("p", "hint", "内存是索引占用（常驻），与文件大小不是一回事："
+      + "实测每 MB 分册约合 " + RAM_PER_BYTE + " MB 索引，上面的「约」按此折算。"));
+
+    function summary() {
+      var n = 0, bytes = 0;
+      for (i = 0; i < books.length; i++) {
+        if (!pending[books[i].slug]) continue;
+        n++; bytes += Number(books[i].bytes) || 0;
+      }
+      info.textContent = "已选 " + n + " / " + books.length + " 部 · 文件 " + fmtMB(bytes)
+        + " · 索引约 " + fmtMB(bytes * RAM_PER_BYTE);
+    }
+    summary();
+  }
+
+  function applySelection(lib, pending, btn) {
+    var slugs = [];
+    for (var k in pending) if (Object.prototype.hasOwnProperty.call(pending, k)) slugs.push(k);
+    if (btn) btn.disabled = true;
+    setStatus("正在重载史书，请稍候…", "ready");
+    callJsonAuto("SetLibrarySelection", [JSON.stringify(slugs)]).then(function (r) {
+      if (btn) btn.disabled = false;
+      if (!r) { setStatus("史书重载失败：本地引擎没有响应。", "warn"); return; }
+      if (r.ok === false) { setStatus("史书重载失败：" + friendly(r.error || ""), "warn"); return; }
+      setStatus("已加载 " + (r.docs || 0) + " 则史料 · 索引约 " + Math.round((r.indexKB || 0) / 1024)
+        + " MB", "ready");
+      refreshLibrary();
+    });
+  }
+
+  function showSnapshot(snap) {
+    if (!snap) { setStatus("未能连接本地引擎。", "warn"); return; }
+    if (!snap.local) {
+      var t = "已备 " + (snap.docs || 0) + " 则史料";
+      if (snap.books > 0) t += " · 已加载 " + snap.books + " 部史书";
+      else if (snap.libraryInstalled) t += " · 未加载史书分册";
+      t += " · v" + (snap.version || "");
+      setStatus(t, (snap.docs || 0) > 0 ? "ready" : "warn");
+      if ((snap.docs || 0) > 0) enableSearch();
+      return;
+    }
+    if ((snap.docs || 0) > 0) {
+      setStatus("离线模式 · 已备 " + snap.docs + " 则史料（精度低于内置界面）", "ready");
+      enableSearch();
+    } else {
+      setStatus("未能读取 corpus.json，请确认它与本页面在同一目录。", "warn");
+    }
+  }
+
   function refreshLibrary() {
-    return Promise.all([callJsonAuto("CorpusStats"), callJsonAuto("GetSnapshot")])
-      .then(function (r) { renderLibrary(r[0], r[1]); });
+    return Promise.all([callJsonAuto("CorpusStats"), callJsonAuto("GetSnapshot"),
+      callJsonAuto("GetLibrary")])
+      .then(function (r) {
+        renderLibrary(r[0], r[1]);
+        renderShards(r[2]);
+      });
   }
 
   // ---------- 更新 ----------
@@ -550,21 +717,7 @@
     if (eb) eb.style.display = "none";
 
     // 一律经 callJsonAuto：桥可用则问真引擎，桥不可用会自愈到离线实现（snap.local === true）
-    callJsonAuto("GetSnapshot").then(function (snap) {
-      if (!snap) { setStatus("未能连接本地引擎。", "warn"); return; }
-      if (!snap.local) {
-        setStatus("已备 " + (snap.docs || 0) + " 则史料 · v" + (snap.version || ""),
-          (snap.docs || 0) > 0 ? "ready" : "warn");
-        if ((snap.docs || 0) > 0) enableSearch();
-        return;
-      }
-      if ((snap.docs || 0) > 0) {
-        setStatus("离线模式 · 已备 " + snap.docs + " 则史料（精度低于内置界面）", "ready");
-        enableSearch();
-      } else {
-        setStatus("未能读取 corpus.json，请确认它与本页面在同一目录。", "warn");
-      }
-    });
+    callJsonAuto("GetSnapshot").then(showSnapshot);
 
     // 先问一次：可能是上一个会话已经把包下好、只是没重启（宿主在启动时就会检测）
     callJsonAuto("GetUpdateState").then(applyUpdateState);
@@ -572,7 +725,12 @@
     later(function poll() {
       if (!host()) { later(poll, 60000); return; }
       call("ConsumeDataUpdated").then(function (v) {
-        if (v === true) { setStatus("史料已更新，正在刷新…", "ready"); refreshLibrary(); }
+        if (v === true) {
+          // 热替换会按当前勾选重建语料，状态条的条数/部数都得跟着变
+          setStatus("史料已更新，正在刷新…", "ready");
+          callJsonAuto("GetSnapshot").then(showSnapshot);
+          refreshLibrary();
+        }
       });
       // 后台下载完成后最多 60 秒，藏书阁面板就会显示「新版本已下载，重启后生效」
       callJsonAuto("GetUpdateState").then(applyUpdateState);

@@ -350,12 +350,53 @@ namespace Jigu
                 else sb.AppendLine("停用词表 : " + corpus.StopWordCount + " 个（查询侧的现代虚词，不参与打分）");
 
 
+                // 藏书阁：分片随安装包分发，但只有勾选的几部会被读进内存。
+                // 这一段是那条「按需加载」链路的唯一回归口 —— 它一旦断掉，
+                // 现象是「检索结果悄悄退回精选集」，界面上看不出来。
                 sb.AppendLine();
-                sb.AppendLine("--- 3. C# 检索引擎 Top3（召回回归） ---");
+                sb.AppendLine("--- 3. 藏书阁（史书分片） ---");
+                string shardBase = AppDomain.CurrentDomain.BaseDirectory;
+                List<Library.Book> books = Library.Available(shardBase);
+                if (books.Count == 0)
+                {
+                    sb.AppendLine("分片清单 : 无（本次安装未带 corpus\\index.json，只跑精选集）");
+                }
+                else
+                {
+                    long libBytes = 0;
+                    int libDocs = 0;
+                    foreach (Library.Book b in books) { libBytes += b.Bytes; libDocs += b.Docs; }
+                    sb.AppendLine("可选书目 : " + books.Count + " 部，" + libDocs + " 条，"
+                        + (libBytes / 1048576) + " MB（解压后）");
+                    List<string> sel = Library.LoadSelection(shardBase, null);
+                    sb.AppendLine("已勾选   : " + (sel.Count == 0 ? "（无）" : string.Join(", ", sel.ToArray())));
+                    Corpus lib = new Corpus();
+                    lib.LoadFrom(shardBase, Library.ShardPaths(shardBase, sel));
+                    sb.AppendLine("载入结果 : " + lib.DocCount + " 条 / " + lib.TermCount + " 词 / 索引 "
+                        + (lib.IndexBytes / 1048576) + " MB");
+                    if (lib.DocCount < corpus.DocCount)
+                    {
+                        fails++;
+                        sb.AppendLine("  FAIL 加过分片反而比精选集少（" + lib.DocCount + " < " + corpus.DocCount + "）");
+                    }
+                    else if (sel.Count > 0 && lib.DocCount == corpus.DocCount)
+                    {
+                        fails++;
+                        sb.AppendLine("  FAIL 勾了 " + sel.Count + " 部，却一条都没加载进去");
+                    }
+                    else if (sel.Count > 0)
+                    {
+                        sb.AppendLine();
+                        RunRankDiff(corpus, lib, sb);
+                    }
+                }
+
+                sb.AppendLine();
+                sb.AppendLine("--- 4. C# 检索引擎 Top3（召回回归） ---");
                 fails += RunSearchCases(corpus, sb);
 
                 sb.AppendLine();
-                sb.AppendLine("--- 4. 更新清单 ---");
+                sb.AppendLine("--- 5. 更新清单 ---");
                 string dv = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, Corpus.DataVersionFile);
                 sb.AppendLine("data_version.json : " + (File.Exists(dv) ? "存在" : "缺失"));
                 string av = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AppUpdater.VersionFileName);
@@ -374,6 +415,131 @@ namespace Jigu
             try { File.WriteAllText(outPath, sb.ToString(), new UTF8Encoding(false)); } catch { }
             try { Console.WriteLine(sb.ToString()); } catch { }
             return fails;
+        }
+
+        /// <summary>读内嵌的检索用例；失败时 err 非空</summary>
+        private static IList LoadCases(out string err)
+        {
+            err = null;
+            byte[] raw = Assets.Get("selfcheck-cases.json");
+            if (raw == null) { err = "用例资源缺失：selfcheck-cases.json 没有内嵌进 exe"; return null; }
+            try
+            {
+                IDictionary root = MiniJson.Parse(Encoding.UTF8.GetString(raw)) as IDictionary;
+                IList cases = (root == null) ? null : root["cases"] as IList;
+                if (cases == null || cases.Count == 0) err = "用例为空";
+                return cases;
+            }
+            catch (Exception ex) { err = "用例解析失败: " + ex.Message; return null; }
+        }
+
+        /// <summary>
+        /// 排序验收（A/B）：同一组用例，分别在「只加载精选集」与「精选集 + 勾选的分册」上跑，
+        /// 逐条列出 Top3 的差异。
+        ///
+        /// 这一步只报告，不判定成败 —— 差异本身不是 bug。IDF 是在当前已加载的文档上算的
+        /// （Corpus.cs: n = _docs.Count），多加载几部书，同样的词元的权重就会变，Top3 随之改变。
+        /// 真正要防的是**精选条目被稀释**：新增的原始段落没有 themes，标签桥对它们不生效，
+        /// 只能靠字面命中，而 Top3 只有三个位子。所以统计的是「原来那三条还剩几条」。
+        /// </summary>
+        private static void RunRankDiff(Corpus curated, Corpus loaded, StringBuilder sb)
+        {
+            string err;
+            IList cases = LoadCases(out err);
+            if (cases == null) { sb.AppendLine("排序比对 : 跳过（" + err + "）"); return; }
+
+            sb.AppendLine("--- 3b. 排序比对（只精选 vs 精选 + 已勾选分册）---");
+            int identical = 0, keptAll = 0, lostSome = 0, cases2 = 0, shardHits = 0, totalHits = 0;
+            foreach (object item in cases)
+            {
+                IDictionary c = item as IDictionary;
+                if (c == null) continue;
+                string query = Convert.ToString(c["query"]);
+                if (string.IsNullOrEmpty(query)) continue;
+                cases2++;
+
+                List<Corpus.SearchHit> a = curated.SearchScored(query, 3);
+                List<Corpus.SearchHit> b = loaded.SearchScored(query, 3);
+                // 被挤掉的精选条目离 Top3 有多远：拉长榜单看它的名次与分数差。
+                List<Corpus.SearchHit> wide = loaded.SearchScored(query, 200);
+
+                string[] ta = new string[a.Count], tb = new string[b.Count];
+                int i;
+                for (i = 0; i < a.Count; i++) ta[i] = a[i].Doc.Title;
+                for (i = 0; i < b.Count; i++) tb[i] = b[i].Doc.Title;
+
+                int kept = 0;
+                for (i = 0; i < ta.Length; i++)
+                {
+                    for (int j = 0; j < tb.Length; j++)
+                        if (string.Equals(ta[i], tb[j], StringComparison.Ordinal)) { kept++; break; }
+                }
+                for (i = 0; i < b.Count; i++)
+                {
+                    totalHits++;
+                    string bk = b[i].Doc.Book;
+                    // 精选集的 book 是朝代桶（先秦秦汉/三国两晋/…），分册的 book 直接是史书名
+                    if (!string.IsNullOrEmpty(bk) && !IsDynastyBucket(bk)) shardHits++;
+                }
+                bool same = (ta.Length > 0 && kept == ta.Length && kept == tb.Length);
+                if (same) identical++;
+                if (kept == ta.Length) keptAll++; else lostSome++;
+
+                sb.AppendLine("  " + Convert.ToString(c["id"]).PadRight(3) + " "
+                    + (same ? "同  " : "变  ")
+                    + "只精选：" + Join(ta) + "  |  加载后：" + Join(tb)
+                    + "  |  原有 " + kept + "/" + ta.Length + " 仍在");
+
+                if (!same && b.Count > 0)
+                {
+                    double cut = b[b.Count - 1].Score;
+                    for (i = 0; i < ta.Length; i++)
+                    {
+                        int found = -1;
+                        for (int j = 0; j < wide.Count; j++)
+                            if (string.Equals(wide[j].Doc.Title, ta[i], StringComparison.Ordinal)) { found = j; break; }
+                        if (found >= 0 && found < 3) continue;   // 前三名里还有它，不算被挤
+                        sb.AppendLine("       被挤出：" + ta[i]
+                            + (found < 0 ? "  未进前 200" : "  第 " + (found + 1) + " 名")
+                            + (found < 0 ? "" : "，分数 " + wide[found].Score.ToString("0.00")
+                                + " vs 榜尾 " + cut.ToString("0.00")));
+                    }
+                }
+            }
+            sb.AppendLine("  比对用例 : " + cases2 + " 条；Top3 完全一致 " + identical + " 条，"
+                + "原有三条全保留 " + keptAll + " 条，有条目被挤出 " + lostSome + " 条");
+            sb.AppendLine("  命中来源 : 加载后共 " + totalHits + " 条命中，其中来自史书分册 "
+                + shardHits + " 条（" + (totalHits == 0 ? 0 : shardHits * 100 / totalHits) + "%）");
+            // 这条才是「精选被系统性挤出」的判据：精选只占语料的一小撮，
+            // 却拿走了多少位子。按份数不成比例地少，才算被挤。
+            int curDocs = curated.DocCount, allDocs = loaded.DocCount;
+            sb.AppendLine("  占比对照 : 精选 " + curDocs + " 条占全量 " + allDocs + " 条的 "
+                + (allDocs == 0 ? 0 : curDocs * 100 / allDocs) + "%，"
+                + "却占 Top3 的 " + (totalHits == 0 ? 0 : (totalHits - shardHits) * 100 / totalHits) + "%");
+            sb.AppendLine("  说明     : 差异不是缺陷。IDF 按当前已加载的文档计算，多加载几部书，"
+                + "词元权重随之改变，Top3 就会变 —— 这是「按需加载」的固有性质。"
+                + "要看的是「原有三条被挤出几条」。");
+        }
+
+        private static string[] DynastyBuckets = new string[]
+        { "种子", "先秦秦汉", "三国两晋", "隋唐五代", "两宋", "明", "清" };
+
+        private static bool IsDynastyBucket(string book)
+        {
+            for (int i = 0; i < DynastyBuckets.Length; i++)
+                if (string.Equals(book, DynastyBuckets[i], StringComparison.Ordinal)) return true;
+            return false;
+        }
+
+        private static string Join(string[] a)
+        {
+            StringBuilder s = new StringBuilder();
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (i > 0) s.Append(" / ");
+                s.Append(string.IsNullOrEmpty(a[i]) ? "(无题)" : a[i]);
+            }
+            return s.Length == 0 ? "(空)" : s.ToString();
         }
 
         /// <summary>

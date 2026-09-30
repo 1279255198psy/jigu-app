@@ -1,0 +1,30 @@
+{
+  "note": "由 tools/convert-24histories 生成，勿手改",
+  "source_url": "https://github.com/alephpi/24histories-simplified-chinese",
+  "books": [
+    {"slug":"shiji", "book":"史记", "dynasty":"西汉", "docs":4866, "chars":617372, "bytes":5332394, "pairing":"段译配对"},
+    {"slug":"hanshu", "book":"汉书", "dynasty":"东汉", "docs":6202, "chars":882643, "bytes":7192882, "pairing":"段译配对"},
+    {"slug":"houhanshu", "book":"后汉书", "dynasty":"南朝宋", "docs":2441, "chars":752250, "bytes":4989959, "pairing":"整章对齐"},
+    {"slug":"sanguozhi", "book":"三国志", "dynasty":"西晋", "docs":2479, "chars":429678, "bytes":3625977, "pairing":"段译配对"},
+    {"slug":"jinshu", "book":"晋书", "dynasty":"唐", "docs":3742, "chars":1158147, "bytes":6087200, "pairing":"部分对齐"},
+    {"slug":"songshu", "book":"宋书", "dynasty":"南朝梁", "docs":1572, "chars":487823, "bytes":3351711, "pairing":"部分对齐"},
+    {"slug":"nanqishu", "book":"南齐书", "dynasty":"南朝梁", "docs":406, "chars":126557, "bytes":900869, "pairing":"整章对齐"},
+    {"slug":"liangshu", "book":"梁书", "dynasty":"唐", "docs":392, "chars":122832, "bytes":894232, "pairing":"整章对齐"},
+    {"slug":"chenshu", "book":"陈书", "dynasty":"唐", "docs":314, "chars":95824, "bytes":716072, "pairing":"整章对齐"},
+    {"slug":"weishu", "book":"魏书", "dynasty":"北齐", "docs":3147, "chars":975998, "bytes":5677756, "pairing":"部分对齐"},
+    {"slug":"beiqishu", "book":"北齐书", "dynasty":"唐", "docs":280, "chars":87436, "bytes":625437, "pairing":"整章对齐"},
+    {"slug":"zhoushu", "book":"周书", "dynasty":"唐", "docs":310, "chars":96880, "bytes":682896, "pairing":"整章对齐"},
+    {"slug":"suishu", "book":"隋书", "dynasty":"唐", "docs":1566, "chars":491658, "bytes":1852835, "pairing":"部分对齐"},
+    {"slug":"nanshi", "book":"南史", "dynasty":"唐", "docs":780, "chars":244310, "bytes":1208442, "pairing":"部分对齐"},
+    {"slug":"beishi", "book":"北史", "dynasty":"唐", "docs":1156, "chars":357304, "bytes":1938118, "pairing":"部分对齐"},
+    {"slug":"jiutangshu", "book":"旧唐书", "dynasty":"后晋", "docs":8092, "chars":2407041, "bytes":11579468, "pairing":"部分对齐"},
+    {"slug":"xintangshu", "book":"新唐书", "dynasty":"北宋", "docs":2113, "chars":647925, "bytes":2890454, "pairing":"部分对齐"},
+    {"slug":"jiuwudaishi", "book":"旧五代史", "dynasty":"北宋", "docs":2248, "chars":704950, "bytes":3529468, "pairing":"部分对齐"},
+    {"slug":"xinwudaishi", "book":"新五代史", "dynasty":"北宋", "docs":1066, "chars":332988, "bytes":2274776, "pairing":"部分对齐"},
+    {"slug":"songshi", "book":"宋史", "dynasty":"元", "docs":15691, "chars":4974211, "bytes":16251210, "pairing":"仅原文"},
+    {"slug":"liaoshi", "book":"辽史", "dynasty":"元", "docs":1179, "chars":357732, "bytes":2195483, "pairing":"部分对齐"},
+    {"slug":"jinshi", "book":"金史", "dynasty":"元", "docs":3653, "chars":1122694, "bytes":6011645, "pairing":"部分对齐"},
+    {"slug":"yuanshi", "book":"元史", "dynasty":"明", "docs":3689, "chars":1133777, "bytes":5648475, "pairing":"部分对齐"},
+    {"slug":"mingshi", "book":"明史", "dynasty":"清", "docs":10783, "chars":3338876, "bytes":20047670, "pairing":"部分对齐"}
+  ]
+}

@@ -548,10 +548,12 @@ namespace Jigu
                 catch (Exception ex) { Log.Error("InitTray", ex); }
                 try
                 {
-                    Corpus c = new Corpus();
-                    c.LoadFrom(AppDomain.CurrentDomain.BaseDirectory);
-                    _corpus = c;
-                    Log.Write("corpus ready: " + c.DocCount + " docs, " + c.TermCount + " terms");
+                    // 精选语料 + 藏书阁里勾选的史书分片。没勾的不读进来 —— 索引常驻，
+                    // 全量二十四史要约 1.4 GB，只能按需。
+                    string corpusDir = AppDomain.CurrentDomain.BaseDirectory;
+                    RebuildCorpus(Library.LoadSelection(corpusDir, null), false);
+                    Log.Write("corpus ready: " + (_corpus == null ? 0 : _corpus.DocCount) + " docs, "
+                        + (_corpus == null ? 0 : _corpus.TermCount) + " terms");
                 }
                 catch (Exception ex) { Log.Error("corpus init", ex); }
                 // 先看有没有「上次已经下载好、还没应用」的包。纯本地判断，快，
@@ -566,6 +568,30 @@ namespace Jigu
                 try { SilentUpdate(); }
                 catch (Exception ex) { Log.Error("SilentUpdate", ex); }
             });
+        }
+
+        /// <summary>当前勾选的史书 slug，供藏书阁回显与状态条计数</summary>
+        private List<string> _selectedShards = new List<string>();
+
+        internal List<string> CurrentSelection() { return _selectedShards; }
+
+        /// <summary>
+        /// 按勾选重建语料。旧实例整个被换掉（_corpus = fresh），旧索引失去引用交给 GC ——
+        /// 与数据更新后的热替换是同一条路径。rebuild 是「重解析 + 重建索引」，前四史量级
+        /// 约几秒，所以调用方必须先摆出忙碌态。
+        /// </summary>
+        private Corpus RebuildCorpus(IList<string> slugs, bool persist)
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            List<string> sel = Library.Sanitize(baseDir, slugs);
+            Corpus fresh = new Corpus();
+            fresh.LoadFrom(baseDir, Library.ShardPaths(baseDir, sel));
+            _corpus = fresh;
+            _selectedShards = sel;
+            if (persist) Library.SaveSelection(null, sel);
+            Log.Write("library reload: " + sel.Count + " shards, " + fresh.DocCount + " docs, index≈"
+                + (fresh.IndexBytes / 1024) + " KB");
+            return fresh;
         }
 
         private void InitTray()
@@ -975,9 +1001,11 @@ namespace Jigu
                     // 的 _corpus 还是旧的，标签检索要等下次启动才生效。
                     if (r.Merged.Count > 0 || r.FilesUpdated.Count > 0)
                     {
-                        Corpus fresh = new Corpus();
-                        fresh.LoadFrom(baseDir);
-                        _corpus = fresh;   // 旧语料失去引用，交给 GC；不再做强制的 GC.Collect
+                        // 走与启动、藏书阁同一条路。这里以前是 LoadFrom(baseDir)，只读精选集 ——
+                        // 数据通道一有动静就把用户勾的史书整个丢掉（实测日志里
+                        // 「corpus rebuilt: 201 docs」就是这个）。分片不在数据通道里，
+                        // 磁盘上那份没被动过，按勾选重读即可。
+                        Corpus fresh = RebuildCorpus(_selectedShards, false);   // 旧语料失去引用交给 GC
                         _dataUpdated = true;
                         Log.Write("corpus rebuilt: " + fresh.DocCount + " docs");
                     }
@@ -1502,8 +1530,46 @@ namespace Jigu
                 sb.Append("\"os\":\"").Append(Json.Escape(Sys.Describe())).Append("\",");
                 sb.Append("\"fallbackBrowser\":\"").Append(Json.Escape(Sys.FindFallbackBrowser() ?? "")).Append("\",");
                 sb.Append("\"docs\":").Append(_form._corpus == null ? 0 : _form._corpus.DocCount).Append(',');
+                sb.Append("\"books\":").Append(_form.CurrentSelection().Count).Append(',');
+                sb.Append("\"libraryInstalled\":")
+                  .Append(Library.IsInstalled(AppDomain.CurrentDomain.BaseDirectory) ? "true" : "false").Append(',');
                 sb.Append("\"version\":\"").Append(AppVer.Number).Append("\"}");
                 return sb.ToString();
+            }
+
+            /// <summary>藏书阁：可选书目 + 当前勾选 + 体积汇总</summary>
+            public string GetLibrary()
+            {
+                try { return Library.ToJson(AppDomain.CurrentDomain.BaseDirectory, _form.CurrentSelection()); }
+                catch (Exception ex)
+                {
+                    Log.Error("GetLibrary", ex);
+                    return "{\"installed\":false,\"books\":[]}";
+                }
+            }
+
+            /// <summary>设置勾选 → 立即重建语料 → 回传新统计。界面需在此期间显示忙碌态。</summary>
+            public string SetLibrarySelection(string jsonArray)
+            {
+                try
+                {
+                    List<string> slugs = new List<string>();
+                    List<object> arr = MiniJson.Parse(jsonArray) as List<object>;
+                    if (arr != null)
+                        foreach (object o in arr)
+                        {
+                            string s = o as string;
+                            if (!string.IsNullOrEmpty(s)) slugs.Add(s);
+                        }
+                    Corpus c = _form.RebuildCorpus(slugs, true);
+                    return "{\"ok\":true,\"docs\":" + c.DocCount + ",\"terms\":" + c.TermCount
+                        + ",\"indexKB\":" + (c.IndexBytes / 1024) + "}";
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("SetLibrarySelection", ex);
+                    return "{\"ok\":false,\"error\":\"" + Json.Escape(ex.Message) + "\"}";
+                }
             }
 
             /// <summary>核心检索：全部在 C# 完成，前端只拿 Top3 结果 JSON</summary>
@@ -1929,8 +1995,11 @@ namespace Jigu
         {
             try
             {
+                // 内置界面没有藏书阁，但勾选记录是共用的：用户在外面的藏书阁选过的史书，
+                // 掉到内置界面也该查得到，否则换个界面同样的词给出不一样的 Top3。
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
                 Corpus c = new Corpus();
-                c.LoadFrom(AppDomain.CurrentDomain.BaseDirectory);
+                c.LoadFrom(baseDir, Library.ShardPaths(baseDir, Library.LoadSelection(baseDir, null)));
                 _corpus = c;
                 ShowStatus("书库已就绪：" + c.DocCount + " 条史料 · " + c.TermCount + " 个索引词");
             }
