@@ -4,7 +4,8 @@
 #
 # How to trigger:
 #   - push a version tag:   git tag v0.1.0 && git push origin v0.1.0
-#     (RELEASE.cmd in the repo root does exactly this, in one double-click)
+#     (tools/release.ps1 does exactly this: commit in VS Code, then run the task
+#      "Jigu: release", or  powershell -NoProfile -File tools\release.ps1)
 #   - or run this workflow manually from the Actions tab
 #
 # Why a Windows runner: the build uses the in-box .NET Framework compiler
@@ -41,6 +42,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 手动触发说的是「发布这个已存在的 tag」，不写 ref 就会检出默认分支的现状：
+          # 构建出来的是主干代码，却挂着旧 tag 的名字发布出去。
+          # tag 推送时 github.ref 本来就是该 tag，行为与从前一致。
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Show toolchain
         shell: pwsh
@@ -51,6 +57,24 @@ jobs:
           Write-Host "csc      : $csc (exists: $(Test-Path $csc))"
           if (-not (Test-Path $csc)) { throw 'in-box C# compiler is missing on this runner' }
           Write-Host "version  : $((Select-String -Path build.ps1 -Pattern '^\$version = "([^"]+)"').Matches[0].Groups[1].Value)"
+
+      - name: Check the tag matches the version compiled in by build.ps1
+        shell: pwsh
+        run: |
+          # 自动更新靠版本号比较来决定要不要提示用户，所以「tag」和「程序里认的版本」
+          # 必须是同一个数。不一致的后果不是报错，而是发出去的包永远提示有新版本、
+          # 装完又回到旧版本号，无限循环 —— 这里拦住它，比事后排查便宜得多。
+          $ErrorActionPreference = 'Stop'
+          $ver = (Select-String -Path build.ps1 -Pattern '^\$version = "([^"]+)"').Matches[0].Groups[1].Value
+          $tag = $env:GITHUB_REF_NAME
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') { $tag = '${{ github.event.inputs.tag }}' }
+
+          $expected = "v$ver"
+          Write-Host "tag      : $tag"
+          Write-Host "build.ps1: $ver (expected tag $expected)"
+          if ($tag -ne $expected) {
+            throw "tag '$tag' 与 build.ps1 里的版本号 '$ver' 不一致（应为 '$expected'）。先把 build.ps1 顶部的版本号改掉再打 tag。"
+          }
 
       - name: Fetch the WebView2 SDK
         shell: pwsh
@@ -103,7 +127,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $dist = Join-Path $PWD 'dist'
-          $appDir = Get-ChildItem $dist -Directory | Select-Object -First 1
+          # dist\ 里除了程序目录还有一个 ASCII 名的 update\（更新通道）。按枚举顺序
+          # 取「第一个目录」会稳定拿到 update，于是下面去找 dist\update\update.exe，
+          # 必然 Test-Path 失败、构建每次都挂 —— 必须显式排掉它。
+          $appDirs = @(Get-ChildItem $dist -Directory | Where-Object { $_.Name -ne 'update' })
+          if ($appDirs.Count -ne 1) {
+            throw "expected exactly one app directory under dist (excluding 'update'), found $($appDirs.Count): $(($appDirs | ForEach-Object { $_.Name }) -join ', ')"
+          }
+          $appDir = $appDirs[0]
           $exe = Join-Path $appDir.FullName ($appDir.Name + '.exe')
           $zip = Get-ChildItem $dist -Filter '*.zip' | Select-Object -First 1
           $setup = Get-ChildItem $dist -Filter '*.exe' | Select-Object -First 1
@@ -125,9 +156,17 @@ jobs:
         with:
           name: jigu-windows-${{ matrix.name }}
           if-no-files-found: error
+          # dist/update/ 是 build.ps1 备好的「更新通道」目录，开发者本地可以整个把它
+          # 当上传源用。这里只取四个清单/语料文件（它们会挂到 Release 上，让默认的
+          # github: 源对程序本体和语料两条通道都零配置可用）；同目录里那份安装包副本
+          # 与上面的 dist/*.exe 是同一个文件，不必重复上传。
           path: |
             dist/*.zip
             dist/*.exe
+            dist/update/data_version.json
+            dist/update/corpus.json
+            dist/update/labels.json
+            dist/update/stopwords.json
 
   release:
     name: publish release
@@ -136,6 +175,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 全量历史：下面生成更新说明时要按 tag 取上一个版本到本版本之间的提交标题
+          fetch-depth: 0
+          # 与 build job 同一个理由：手动触发时要发的是那个 tag，不是默认分支的现状。
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Resolve tag and version
         id: meta
@@ -169,9 +213,99 @@ jobs:
           SETUP=$(ls artifacts/*.exe | head -n1)
           cp "$ZIP"   "release/jigu-portable-$TAG.zip"
           cp "$SETUP" "release/jigu-installer-$TAG.exe"
+          # 语料通道：清单与三个数据文件跟着同一个 Release 走。默认更新源是
+          # github:rdfghjgyuytytrudthgc/jigu-app，所以程序本体和语料两条通道
+          # 都不需要额外配置任何服务器。
+          # upload-artifact 会按公共父目录保留层级（这四个文件落在 update/ 下），
+          # 但那是它的实现细节，用 find 兜住；后面逐个检查，漏挂一定报错。
+          find artifacts -name '*.json' -exec cp {} release/ \;
+          for f in data_version.json corpus.json labels.json stopwords.json; do
+            [ -f "release/$f" ] || { echo "缺少更新通道文件：$f"; exit 1; }
+          done
           ls -l release
+          # SHA256SUMS.txt 留到 app_version.json 生成之后再算，让它也覆盖到该文件
+
+      - name: Generate app_version.json (the update manifest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TAG="${{ steps.meta.outputs.tag }}"
+          export VERSION="${{ steps.meta.outputs.version }}"
+          # 这份清单是自动更新唯一的「新版本在哪」的来源。程序优先读它，
+          # 读不到才回退到「按 tag + 附件名 + SHA256SUMS.txt 推导」，两条路都通。
+          # url 写成附件名而不写死绝对地址：程序会拿它去 Release 的附件表里查
+          # browser_download_url，地址随附件漂移也不会失效。
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess
+
+          tag = os.environ["TAG"]
+          version = os.environ["VERSION"]
+          installer = "jigu-installer-%s.exe" % tag
+
+          path = os.path.join("release", installer)
+          if not os.path.isfile(path):
+              raise SystemExit("找不到已放置的安装包：" + path)
+
+          with open(path, "rb") as fh:
+              sha = hashlib.sha256(fh.read()).hexdigest()
+
+
+          def notes_from_changelog():
+              """CHANGELOG.md 里该版本的小节（比提交标题更像给人看的更新说明）"""
+              if not os.path.isfile("CHANGELOG.md"):
+                  return ""
+              head = re.compile(r"^##(?!#)\s*\[?v?" + re.escape(version) + r"\b")
+              out, keep = [], False
+              with open("CHANGELOG.md", encoding="utf-8") as fh:
+                  for line in fh:
+                      line = line.rstrip()
+                      if re.match(r"^##(?!#)", line.strip()):
+                          if keep:
+                              break
+                          keep = bool(head.match(line.strip()))
+                      elif keep:
+                          out.append(line.strip())
+              return "\n".join(out).strip()
+
+
+          def notes_from_commits():
+              """上一个 tag 到本 tag 之间的提交标题（仓库没有 CHANGELOG.md 时的主力）"""
+              def run(args):
+                  try:
+                      return subprocess.run(args, capture_output=True, text=True,
+                                            timeout=60).stdout.strip()
+                  except Exception:
+                      return ""
+              prev = run(["git", "describe", "--tags", "--abbrev=0", tag + "^"])
+              if not prev:
+                  return ""
+              log = run(["git", "log", "--no-merges", "--pretty=format:%s", prev + ".." + tag])
+              subs = [s.strip() for s in log.splitlines() if s.strip()]
+              return "\n".join("· " + s for s in subs[:6])
+
+
+          # 这段说明会原样出现在「新版本已下载完成」的弹窗里，长了没法看。
+          notes = notes_from_changelog() or notes_from_commits() or ("稽古 %s 发布" % tag)
+          notes = re.sub(r"\n{3,}", "\n\n", notes).strip()
+          if len(notes) > 600:
+              notes = notes[:599].rstrip() + "…"
+
+          manifest = {
+              "version": version,
+              "url": installer,
+              "sha256": sha,
+              "notes": notes,
+              "mandatory": False,
+          }
+          text = json.dumps(manifest, ensure_ascii=False, indent=2)
+          with open("release/app_version.json", "w", encoding="utf-8") as fh:
+              fh.write(text + "\n")
+          print(text)
+          PY
+          # 现在算总和：app_version.json 已就位，校验和文件把 Release 上的每个文件都覆盖到
           (cd release && sha256sum * > SHA256SUMS.txt)
           cat release/SHA256SUMS.txt
+          cat release/app_version.json
 
       - name: Write release notes
         shell: bash
@@ -213,7 +347,7 @@ jobs:
           完整说明见仓库里的 `README.md` 与 `使用说明.txt`。
 
           ---
-          *完整改动记录见 [README.md](https://github.com/${{ github.repository }}/blob/${{ steps.meta.outputs.tag }}/README.md)*
+          *完整改动记录见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ steps.meta.outputs.tag }}/CHANGELOG.md)*
           EOF
           # 去掉 heredoc 的缩进（EOF 用了缩进形式）
           sed -i 's/^          //' release-body.md

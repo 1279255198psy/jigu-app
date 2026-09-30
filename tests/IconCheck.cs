@@ -19,9 +19,15 @@ internal static class IconCheck
     private static void Ok(string s) { Say("  OK   " + s); }
     private static void Fail(string s) { _fails++; Say("  FAIL " + s); }
 
+    /// <summary>仓库根目录：探针 exe 就放在 &lt;root&gt;\tests\ 下，别写死本机的绝对路径。</summary>
+    private static string RepoRoot()
+    {
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+    }
+
     private static int Main(string[] args)
     {
-        string root = args.Length > 0 ? args[0] : @"D:\DSH\jigu-app";
+        string root = args.Length > 0 ? args[0] : RepoRoot();
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
 
         Say("== 图标校验 ==");
@@ -52,25 +58,44 @@ internal static class IconCheck
         else Fail("缺少安装包");
 
         // ---------- 4. 安装包负载内的图标文件 ----------
-        string payloadGen = Path.Combine(root, @"src\InstallerPayload.g.cs");
-        if (File.Exists(payloadGen))
+        // 图标文件名带版本号（Windows 按路径缓存图标，换版本必须换路径），所以这里
+        // 不能写死某一个版本 —— 写死了版本一升探针就永远 FAIL，真问题反而被淹掉。
+        // 改成问"交付目录里那个图标，负载里有没有同名条目"，与版本号解耦。
+        string exeDir = Path.Combine(root, @"dist\稽古");
+        string[] icons = Directory.Exists(exeDir)
+            ? Directory.GetFiles(exeDir, "Jigu-*.ico")
+            : new string[0];
+        if (icons.Length == 0)
         {
-            string text = File.ReadAllText(payloadGen, Encoding.UTF8);
-            if (text.IndexOf("Jigu-1.4.ico", StringComparison.Ordinal) >= 0)
-                Ok("安装包负载内含版本化图标 Jigu-1.4.ico（快捷方式与卸载项用它，避开图标缓存）");
-            else
-                Fail("安装包负载缺少版本化图标 Jigu-1.4.ico");
+            Fail("交付目录没有版本化图标 Jigu-*.ico: " + exeDir);
         }
-        else Fail("缺少 InstallerPayload.g.cs");
+        else if (icons.Length > 1)
+        {
+            // build.ps1 每轮都会把上一版留下的 Jigu-*.ico 扫掉，多出来就说明没扫干净，
+            // 旧的图标会跟着交付出去。
+            Fail("交付目录里有 " + icons.Length + " 个 Jigu-*.ico（旧版本图标没清干净）");
+            foreach (string f in icons) Say("       " + Path.GetFileName(f));
+        }
+        else
+        {
+            string iconName = Path.GetFileName(icons[0]);
+            Ok("交付目录含版本化图标 " + iconName);
+
+            string payloadGen = Path.Combine(root, @"src\InstallerPayload.g.cs");
+            if (File.Exists(payloadGen))
+            {
+                string text = File.ReadAllText(payloadGen, Encoding.UTF8);
+                if (text.IndexOf(iconName, StringComparison.Ordinal) >= 0)
+                    Ok("安装包负载内含 " + iconName + "（快捷方式与卸载项用它，避开图标缓存）");
+                else
+                    Fail("安装包负载缺少版本化图标 " + iconName);
+            }
+            else Fail("缺少 InstallerPayload.g.cs");
+        }
 
         // ---------- 5. 是否退化成默认图标 ----------
-        string exeDir = Path.Combine(root, @"dist\稽古");
-        string[] mustHave = { "Jigu-1.4.ico", "稽古.exe" };
-        foreach (string n in mustHave)
-        {
-            if (File.Exists(Path.Combine(exeDir, n))) Ok("交付目录含 " + n);
-            else Fail("交付目录缺少 " + n);
-        }
+        if (File.Exists(Path.Combine(exeDir, "稽古.exe"))) Ok("交付目录含 稽古.exe");
+        else Fail("交付目录缺少 稽古.exe");
 
         Say("");
         Say(_fails == 0 ? "RESULT: ICON OK (0 fails)" : ("RESULT: FAILURES = " + _fails));

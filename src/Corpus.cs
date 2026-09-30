@@ -80,7 +80,11 @@ namespace Jigu
         public bool IsLabelTerm(string term) { return _labels != null && _labels.IsLabel(term); }
 
         /// <summary>查询侧停用词个数（为 0 说明这份表既不在程序目录也没内嵌）</summary>
-        public int StopWordCount { get { return _stop == null ? 0 : _stop.Count; } }        public string SourcePath { get { return _sourcePath; } }
+        public int StopWordCount { get { return _stop == null ? 0 : _stop.Count; } }
+
+        /// <summary>语料文件的实际路径（内嵌兜底时为空），用于界面显示与排错</summary>
+        public string SourcePath { get { return _sourcePath; } }
+
         /// <summary>粗略的索引内存占用（字节），用于日志观察</summary>
         public long IndexBytes
         {

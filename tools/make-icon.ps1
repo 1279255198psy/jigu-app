@@ -2,7 +2,7 @@
 # Generates the ancient-style application icon:
 #   rice-paper background + cinnabar seal frame + the character "Ji" (U+7A3D)
 # Uses only GDI+ (System.Drawing). Outputs multi-size PNGs and one .ico file.
-# Usage: powershell -ExecutionPolicy Bypass -File tools\make-icon.ps1
+# Usage: powershell -NoProfile -File tools\make-icon.ps1
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 

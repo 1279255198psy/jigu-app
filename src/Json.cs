@@ -43,14 +43,43 @@ namespace Jigu
     /// </summary>
     internal static class JsonScan
     {
-        // start/end 是这条文档在原文里的起止位置。Update.cs 的按书合并要用它把每条的
-        // 原始 JSON 文本原样抠出来重新拼接（ObjOf(bytes, start, end)），所以不能删。
+        // start/end 是这条文档的起止位置，单位是**字符**——下标走的是解码后的 string，
+        // 不是传进来的 byte[]。语料全是中文（UTF-8 下一个汉字 3 字节），拿它去切 byte[]
+        // 会切歪，而且偏得越靠后越多。要取原文请用下面的 ObjOf(text, start, end)，
+        // 别自己拿 bytes 去切。
         public delegate void DocHandler(CorpusDoc doc, long start, long end);
+
+        /// <summary>把语料字节解码成扫描器使用的那个 string（下标就是它上面的下标）。</summary>
+        public static string Decode(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0) return "";
+            return Encoding.UTF8.GetString(bytes);
+        }
+
+        /// <summary>
+        /// 按 ForEachDocument 给出的 start/end 取回这条文档的原始 JSON 文本。
+        /// text 必须是喂给扫描器的同一个（或内容相同的）字符串——下标只在它上面成立。
+        /// </summary>
+        public static string ObjOf(string text, long start, long end)
+        {
+            if (text == null) return "";
+            int s = (int)start, e = (int)end;
+            if (s < 0) s = 0;
+            if (s > text.Length) s = text.Length;
+            if (e > text.Length) e = text.Length;
+            if (e < s) e = s;
+            return text.Substring(s, e - s);
+        }
 
         public static void ForEachDocument(byte[] bytes, DocHandler handler)
         {
-            if (bytes == null || bytes.Length == 0) return;
-            string text = Encoding.UTF8.GetString(bytes);
+            ForEachDocument(Decode(bytes), handler);
+        }
+
+        /// <summary>已解码文本的入口。要按 start/end 取原文的调用方走这个，少解码一遍。</summary>
+        public static void ForEachDocument(string text, DocHandler handler)
+        {
+            if (handler == null || string.IsNullOrEmpty(text)) return;
             int i = 0;
             SkipWs(text, ref i);
             if (i >= text.Length) return;
@@ -265,7 +294,10 @@ namespace Jigu
             while (i < text.Length)
             {
                 char c = text[i];
-                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { i++; continue; }
+                // U+FEFF：UTF-8 BOM 解码成 string 之后就是它。带 BOM 的语料原本会走到
+                // 下面「既不是 [ 也不是 {」那条路，静默返回 0 条 —— 不抛异常，也就不会
+                // 回落到内置种子，界面上表现为史料库整个空掉。
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\uFEFF') { i++; continue; }
                 break;
             }
         }

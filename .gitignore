@@ -4,6 +4,10 @@ obj/
 bin/
 src/EmbeddedAssets.g.cs
 src/InstallerPayload.g.cs
+src/Version.g.cs
+# 图标生成过程的中间渲染（tools\make-icon.ps1 的输出）。
+# 真正的资源是 resources\app.ico 与 resources\app.png，那两个要进版本库。
+tools/icon-tmp/
 
 # 安装/更新测试留下的产物树：每个目录里都是一份完整的应用副本（exe + DLL + 语料），
 # 合计约 34 MB，且随时可用 --extract-to / --test-update 重新生成。
@@ -12,9 +16,18 @@ test-extract/
 test-install/
 test-portable-extract/
 test-remote/
+# 按书合并的回归夹具：内容与 test-remote 不同（多一条哨兵史料），
+# 用来验证"整份语料替换"而不是"当成新书追加"。生成脚本见 tests\make-merge-fixture.ps1
+test-remote-merge/
+# 伪造的 GitHub Release JSON（离线验证 github: 模式用，recipe 见 docs\更新服务托管说明.md）
+# 里面的 file:// 绝对路径是本机路径，不进版本库
+test-gh/
 
 # tests\ 下手工 csc 编译出来的检查程序：只保留 .cs 源码
 tests/*.exe
+# 探针跑一次就重写一次的报告：是输出，不是源码。
+# 跟踪它们的代价是每跑一次探针工作区就脏一次，而 tools\release.ps1 会因此拒绝发布。
+tests/*-report.txt
 # tests\ 下那几份 WebView2 DLL 是从 SDK 目录复制来的二进制，用于编译探针程序
 tests/Microsoft.Web.WebView2.*.dll
 tests/WebView2Loader.dll

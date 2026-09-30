@@ -27,9 +27,14 @@ namespace JiguSetup
     {
         public const string AppNameCn = "稽古";
         public const string AppNameEn = "Jigu";
-        public const string Version = "0.1.0";
-        /// <summary>图标文件名带版本号：Windows 会按路径缓存图标，换版本必须换路径</summary>
-        public const string IconFileName = "Jigu-1.6.ico";
+        /// <summary>由 build.ps1 生成的 BuildInfo 提供，勿手写（见 src/Version.g.cs）</summary>
+        public const string Version = BuildInfo.Version;
+        /// <summary>
+        /// 图标文件名带版本号：Windows 会按路径缓存图标，换版本必须换路径。
+        /// 从 BuildInfo.Version 拼出来，跟 build.ps1 的 $iconName 是同一个字符串 ——
+        /// 手写过一版 "Jigu-1.6.ico"，而程序版本早就不是 1.6 了，图标缓存也就一直没换。
+        /// </summary>
+        public const string IconFileName = "Jigu-" + BuildInfo.Version + ".ico";
         public const string Publisher = "稽古";
         public const string AppId = "{7A3D53E4-9F21-4C7B-9C3E-1B2A5D8E4F60}";
         public const string ExeName = "稽古.exe";
@@ -701,13 +706,22 @@ namespace JiguSetup
             catch { }
         }
 
-        /// <summary>我们装进安装目录的文件名（安装包自身携带的清单）</summary>
+        /// <summary>
+        /// 我们装进安装目录的东西，按「相对安装目录、正斜杠分隔」的键记账（如 data/00_种子.json）。
+        /// 必须保留相对路径：装载荷的键原样存的是 data/00_种子.json 这种嵌套形式，
+        /// 而比对时手里只有文件名（00_种子.json），永远对不上 —— 卸载就会认定
+        /// 「目录里不全是我们的东西」，从而留下整份残留。
+        /// </summary>
         private static HashSet<string> OurFileNames()
         {
             HashSet<string> ours = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
-                foreach (KeyValuePair<string, string> kv in InstallerPayload.Table()) ours.Add(kv.Key);
+                foreach (KeyValuePair<string, string> kv in InstallerPayload.Table())
+                {
+                    string key = (kv.Key ?? "").Replace('\\', '/').TrimStart('/');
+                    if (key.Length > 0) ours.Add(key);
+                }
             }
             catch { }
             // 卸载程序是安装时由安装包自己复制出来的，不在清单里
@@ -726,8 +740,78 @@ namespace JiguSetup
         }
 
         /// <summary>
+        /// 替换过程中断（断电、强杀）可能留下的副本，形如 稽古.exe.old / corpus.json.tmp。
+        /// 只认「本体本来就是我们装的」那种 —— 用户自己起的 notes.tmp 不算我们的东西，
+        /// 绝不能因为后缀像就删掉。relKey 与 ours 是同一套键（相对安装目录）。
+        /// </summary>
+        private static bool IsOwnTempCopy(string relKey, HashSet<string> ours)
+        {
+            string n = (relKey ?? "").ToLowerInvariant();
+            string stem;
+            if (n.EndsWith(".old", StringComparison.Ordinal)) stem = n.Substring(0, n.Length - 4);
+            else if (n.EndsWith(".tmp", StringComparison.Ordinal)) stem = n.Substring(0, n.Length - 4);
+            else return false;
+            if (stem.Length == 0) return false;
+            return ours.Contains(stem);
+        }
+
+        /// <summary>
+        /// pending\ 里的东西：待应用的更新包与它的 sidecar 元数据，都是程序自己下进来的。
+        /// 只认这两个精确名字（外加原子写的 .tmp）—— 认宽了，用户往里放的文件就会被递归删掉。
+        /// </summary>
+        private static bool IsOwnPendingEntry(string name)
+        {
+            string n = (name ?? "").ToLowerInvariant();
+            return n == AppUpdater.PendingMetaName.ToLowerInvariant()
+                || n == AppUpdater.PendingExeName.ToLowerInvariant()
+                || n.EndsWith(".tmp", StringComparison.Ordinal);
+        }
+
+        private static bool IsOnlyPendingRecursive(string dir)
+        {
+            try
+            {
+                foreach (string f in Directory.GetFiles(dir))
+                    if (!IsOwnPendingEntry(Path.GetFileName(f))) return false;
+                // pending\ 下不该有子目录；出现了说明拿不准，按既有原则一律不认
+                return Directory.GetDirectories(dir).Length == 0;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>把绝对路径换算成与 OurFileNames() 同一套键（相对安装目录、正斜杠分隔）。</summary>
+        private static string RelKey(string root, string fullPath)
+        {
+            string rel = fullPath.Substring(root.Length);
+            return rel.TrimStart('\\', '/').Replace('\\', '/');
+        }
+
+        /// <summary>清单里有没有「落在这个子目录下」的东西。</summary>
+        private static bool HasKeyUnder(HashSet<string> ours, string dirName)
+        {
+            string prefix = dirName + "/";
+            foreach (string o in ours)
+                if (o.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// 这个文件是不是我们装的。按相对路径比对，所以 data\version.json(我们的)
+        /// 与用户自己放在安装目录顶层的 version.json(他的) 不会被混为一谈。
+        /// </summary>
+        private static bool IsOurs(string root, string file, HashSet<string> ours)
+        {
+            string rel = RelKey(root, file);
+            if (ours.Contains(rel)) return true;
+            // 运行期自己生成的文件（日志、自检报告等）只可能出现在安装目录顶层
+            if (rel.IndexOf('/') < 0 && IsOwnArtifact(rel)) return true;
+            return IsOwnTempCopy(rel, ours);
+        }
+
+        /// <summary>
         /// 安装目录里是不是只有我们的东西：顶层每个文件都必须出自我们的清单或由我们生成，
-        /// 子目录只认 data/ 且其中每一项也必须是我们的。
+        /// 子目录只认 pending/ 与「清单里确实有东西放在里面」的那个（正常就是 data/），
+        /// 且其中每一项也必须是我们的。
         /// 拿不准一律返回 false —— 宁可把文件留下，也不能递归删掉用户的目录。
         /// </summary>
         private static bool IsOurInstallDir(string dir)
@@ -736,28 +820,35 @@ namespace JiguSetup
             {
                 HashSet<string> ours = OurFileNames();
                 foreach (string f in Directory.GetFiles(dir))
-                {
-                    string n = Path.GetFileName(f);
-                    if (!ours.Contains(n) && !IsOwnArtifact(n)) return false;
-                }
+                    if (!IsOurs(dir, f, ours)) return false;
                 foreach (string d in Directory.GetDirectories(dir))
                 {
-                    if (!string.Equals(Path.GetFileName(d), "data", StringComparison.OrdinalIgnoreCase)) return false;
-                    if (!IsOnlyOursRecursive(d, ours)) return false;
+                    string n = Path.GetFileName(d);
+                    // pending/ 是「下载好了、还没应用」的更新包。用户点了「稍后」它就会
+                    // 一直留着 —— 不认它的话，只要动过一次更新，卸载就再也删不掉安装目录。
+                    if (string.Equals(n, AppUpdater.PendingDirName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!IsOnlyPendingRecursive(d)) return false;
+                    }
+                    else if (HasKeyUnder(ours, n))
+                    {
+                        if (!IsOnlyOursRecursive(d, dir, ours)) return false;
+                    }
+                    else return false;
                 }
                 return true;
             }
             catch { return false; }
         }
 
-        private static bool IsOnlyOursRecursive(string dir, HashSet<string> ours)
+        private static bool IsOnlyOursRecursive(string dir, string root, HashSet<string> ours)
         {
             try
             {
                 foreach (string f in Directory.GetFiles(dir))
-                    if (!ours.Contains(Path.GetFileName(f))) return false;
+                    if (!IsOurs(root, f, ours)) return false;
                 foreach (string d in Directory.GetDirectories(dir))
-                    if (!IsOnlyOursRecursive(d, ours)) return false;
+                    if (!IsOnlyOursRecursive(d, root, ours)) return false;
                 return true;
             }
             catch { return false; }
@@ -770,14 +861,18 @@ namespace JiguSetup
             {
                 HashSet<string> ours = OurFileNames();
                 foreach (string f in Directory.GetFiles(dir))
-                {
-                    string n = Path.GetFileName(f);
-                    if (ours.Contains(n) || IsOwnArtifact(n)) TryDelete(f);
-                }
+                    if (IsOurs(dir, f, ours)) TryDelete(f);
                 string data = Path.Combine(dir, "data");
-                if (Directory.Exists(data) && IsOnlyOursRecursive(data, ours))
+                if (Directory.Exists(data) && IsOnlyOursRecursive(data, dir, ours))
                 {
                     try { Directory.Delete(data, true); } catch { }
+                }
+                // 待应用的更新包也归我们。以前这里漏了它，导致用户一旦点过「稍后」，
+                // 卸载就会把一份完整的安装包留在人家的磁盘上。
+                string pending = Path.Combine(dir, AppUpdater.PendingDirName);
+                if (Directory.Exists(pending) && IsOnlyPendingRecursive(pending))
+                {
+                    try { Directory.Delete(pending, true); } catch { }
                 }
             }
             catch { }
@@ -804,8 +899,10 @@ namespace JiguSetup
                         return;
                     }
                 }
-                int n = InstallerPayload.ExtractTo(dest);
-                Environment.ExitCode = n > 0 ? 0 : 1;
+                int failed;
+                int n = InstallerPayload.ExtractTo(dest, out failed);
+                // 同 AppMain：2 = 写了一部分，调用方据此判断这次释放不算成功
+                Environment.ExitCode = failed > 0 ? 2 : (n > 0 ? 0 : 1);
                 return;
             }
 

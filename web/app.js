@@ -175,10 +175,17 @@
     }
     if (name === "CorpusStats") return localStats();
     if (name === "ConsumeDataUpdated") return Promise.resolve(false);
+    // 离线（页面被系统浏览器直接打开）时本机没有更新服务：如实回答，不要假装"已就绪"
+    if (name === "GetUpdateState") return Promise.resolve({ ready: false, phase: "idle", snoozed: false });
+    if (name === "ApplyReadyUpdate") {
+      return Promise.resolve({ updating: false, message: "离线模式下没有可用的更新服务。" });
+    }
+    // version 留空：这条路径根本没有宿主可问，报一个写死的版本号只会误导用户
+    // （以前写死 "1.6.0"，而程序版本早就不是它了）。界面对空值有专门的分支。
     if (name === "GetSnapshot") return loadLocalCorpus().then(function (C) {
-      return { version: "1.6.0", local: true, docs: C.docs.length };
+      return { version: "", local: true, docs: C.docs.length };
     }, function () {
-      return { version: "1.6.0", local: true, docs: 0 };
+      return { version: "", local: true, docs: 0 };
     });
     return Promise.resolve(null);
   }
@@ -406,7 +413,7 @@
     if (snapshot) {
       box.appendChild(el("p", "hint", "系统：" + (snapshot.os || "—")
         + " · 界面内核 WebView2：" + (snapshot.webview2 ? "正常" : "缺失")
-        + " · 程序版本 v" + (snapshot.version || "—")));
+        + (snapshot.version ? " · 程序版本 v" + snapshot.version : " · 程序版本未知")));
       box.appendChild(el("p", "hint", "史料文件：" + (stats.source || "—")));
     }
   }
@@ -433,16 +440,58 @@
       if (r && r.mergedCount > 0) refreshLibrary();
     });
   }
+  // 程序更新是「后台静默下载，下好了才提示重启」，所以界面这里不发起下载，
+  // 只渲染宿主的状态：ready 表示包已经躺在本机，重启即生效。
+  var updateState = null;      // 最近一次 GetUpdateState 的结果
+  var announcedVersion = "";   // 同一个版本的就绪横幅只播报一次，别每分钟刷一遍
+
+  function applyUpdateState(s) {
+    updateState = (s && typeof s === "object") ? s : null;
+    var ready = !!(updateState && updateState.ready);
+    var snoozed = !!(updateState && updateState.snoozed);
+    var btn = $("apply-app"), snz = $("snooze-app");
+    if (btn) btn.textContent = ready ? "重启并更新" : "立即更新";
+    if (snz) snz.style.display = (ready && !snoozed) ? "" : "none";
+    if (!updateState) return;
+
+    if (ready && !snoozed) {
+      if (announcedVersion === updateState.remoteVersion) return;
+      announcedVersion = updateState.remoteVersion;
+      var t = "新版本 v" + (updateState.remoteVersion || "?") + " 已下载完成，重启后生效。";
+      if (updateState.notes) t += "\n" + updateState.notes;
+      showReport(t);
+    } else if (updateState.phase === "downloading") {
+      showReport("正在后台下载新版本…"
+        + (updateState.progress > 0 ? "（" + updateState.progress + "%）" : ""));
+    }
+    // 其余情况不动报告区：那是用户上一次手动操作留下的结果，不该被轮询擦掉
+  }
+
   function checkApp() {
     showReport("正在检查程序更新…");
-    callJson("CheckAppUpdate").then(function (r) { showReport(reportText(r, "程序")); });
+    callJson("CheckAppUpdate").then(function (r) {
+      showReport(reportText(r, "程序"));
+      return callJsonAuto("GetUpdateState");
+    }).then(applyUpdateState);
   }
   function applyApp() {
-    showReport("正在准备更新…");
-    callJson("StartAppUpdate").then(function (r) {
+    // 已经下好就直接换（这一步不碰网络，断网也能重启完成更新）；
+    // 否则交给宿主：检查 + 转后台下载
+    var ready = !!(updateState && updateState.ready);
+    showReport(ready ? "正在重启并更新…" : "正在准备更新…");
+    var p = ready ? callJson("ApplyReadyUpdate") : callJson("StartAppUpdate");
+    p.then(function (r) {
       showReport(reportText(r, "程序"));
       if (r && r.updating) setStatus("正在更新并重启，请稍候…", "ready");
     });
+  }
+  function snoozeApp() {
+    var v = updateState ? (updateState.remoteVersion || "") : "";
+    var snz = $("snooze-app");
+    if (snz) snz.style.display = "none";
+    if (updateState) updateState.snoozed = true;
+    showReport("新版本 v" + (v || "?") + " 已下载，这次先不更新，下次启动时再提示。");
+    return call("SnoozeUpdate", [v]);
   }
 
   // ---------- 页签 ----------
@@ -491,6 +540,7 @@
     bind("apply-data", applyData);
     bind("check-app", checkApp);
     bind("apply-app", applyApp);
+    bind("snooze-app", snoozeApp);
     bind("open-folder", function () { call("ShowDataFolder"); });
     bind("explain-toggle", function () {
       var b = $("explain-body");
@@ -516,11 +566,16 @@
       }
     });
 
+    // 先问一次：可能是上一个会话已经把包下好、只是没重启（宿主在启动时就会检测）
+    callJsonAuto("GetUpdateState").then(applyUpdateState);
+
     later(function poll() {
       if (!host()) { later(poll, 60000); return; }
       call("ConsumeDataUpdated").then(function (v) {
         if (v === true) { setStatus("史料已更新，正在刷新…", "ready"); refreshLibrary(); }
       });
+      // 后台下载完成后最多 60 秒，藏书阁面板就会显示「新版本已下载，重启后生效」
+      callJsonAuto("GetUpdateState").then(applyUpdateState);
       later(poll, 60000);
     }, 60000);
 

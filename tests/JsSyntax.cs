@@ -5,9 +5,15 @@ using System.Text;
 // Validates web assets: presence, comment/string-aware bracket balance, required symbols.
 internal static class JsSyntax
 {
+    /// <summary>仓库根目录：探针 exe 就放在 &lt;root&gt;\tests\ 下，别写死本机的绝对路径。</summary>
+    private static string RepoRoot()
+    {
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+    }
+
     private static int Main(string[] args)
     {
-        string appDir = args != null && args.Length > 0 ? args[0] : @"D:\DSH\jigu-app";
+        string appDir = args != null && args.Length > 0 ? args[0] : RepoRoot();
         string webDir = Path.Combine(appDir, "web");
         StringBuilder sb = new StringBuilder();
         int fails = 0;

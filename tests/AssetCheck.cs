@@ -21,10 +21,19 @@ internal static class AssetCheck
     private static void Say(string s) { Out.Add(s); Console.WriteLine(s); }
     private static void Fail(string s) { _fails++; Say("  FAIL " + s); }
 
+    /// <summary>仓库根目录：探针 exe 就放在 &lt;root&gt;\tests\ 下，别写死本机的绝对路径。</summary>
+    private static string RepoRoot()
+    {
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+    }
+
     private static int Main(string[] args)
     {
-        string exe = args.Length > 0 ? args[0] : @"D:\DSH\jigu-app\dist\稽古\稽古.exe";
-        string report = args.Length > 1 ? args[1] : @"D:\DSH\jigu-app\tests\asset-check-report.txt";
+        string appName = "稽古";
+        string exe = args.Length > 0 ? args[0]
+            : Path.Combine(RepoRoot(), "dist", appName, appName + ".exe");
+        string report = args.Length > 1 ? args[1]
+            : Path.Combine(RepoRoot(), "tests", "asset-check-report.txt");
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
 
         Say("== 内存加载校验 ==");

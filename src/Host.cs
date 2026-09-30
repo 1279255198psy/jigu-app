@@ -479,8 +479,25 @@ namespace Jigu
         private bool _workStarted;   // 后台重活（语料/更新/托盘）只启动一次
         private bool _navDone;
         private volatile bool _dataUpdated;
-        private volatile bool _updateBusy;
+        // 数据更新的互斥门：0 = 空闲，1 = 有线程正在重写语料。只保护「会写盘」的那一路。
+        // 用 Interlocked 而不是 volatile bool：两个线程可能同时通过 if 判断，
+        // 而「清标志」必须是持有者的动作 —— 详见 RunDataCheck 的注释。
+        private int _updateGate;
         private string _dataBase;
+
+        // ---- 程序本体更新：后台预下载 → 就绪 → 用户确认重启 ----
+        // 状态机放在字段上而不是局部变量里，是因为下载在后台线程跑，而提示与按钮在界面线程。
+        private readonly object _appGate = new object();
+        private volatile string _appPhase = "idle";   // idle | downloading | ready | applying
+        private AppUpdater.Report _appReady;          // 已下载并校验通过、等待应用的那一份
+        private string _appReadyPkg;
+        private volatile int _appProgress;            // 0-100，仅用于界面显示
+        // 这两个都按**版本**记，不能只存布尔：存布尔的话第一次点过「稍后」之后，
+        // 以后每个版本都会被当成「已忽略」——横幅不播、稍後按钮不显示、弹框也不再弹。
+        private volatile string _appSnoozed = "";     // 用户点过「稍后」的那个版本
+        private volatile string _appNotified = "";    // 已经弹过就绪提示的那个版本
+        private System.Threading.Timer _recheck;      // 常驻时的周期性复查
+        private int _checking;                        // 检查重入保护
 
         /// <summary>本地语料（检索全部由它完成）</summary>
         internal Corpus _corpus;
@@ -537,6 +554,15 @@ namespace Jigu
                     Log.Write("corpus ready: " + c.DocCount + " docs, " + c.TermCount + " terms");
                 }
                 catch (Exception ex) { Log.Error("corpus init", ex); }
+                // 先看有没有「上次已经下载好、还没应用」的包。纯本地判断，快，
+                // 而且必须在网络检查之前 —— 否则会把已经下好的东西再下一次。
+                try
+                {
+                    string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                    AppUpdater.Report pending = AppUpdater.FindPending(baseDir);
+                    if (pending != null) SetAppUpdateReady(pending, AppUpdater.PendingPath(baseDir));
+                }
+                catch (Exception ex) { Log.Error("find pending update", ex); }
                 try { SilentUpdate(); }
                 catch (Exception ex) { Log.Error("SilentUpdate", ex); }
             });
@@ -595,6 +621,8 @@ namespace Jigu
         {
             try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; } }
             catch { }
+            try { if (_recheck != null) { _recheck.Dispose(); _recheck = null; } }
+            catch { }
             base.OnFormClosed(e);
         }
 
@@ -605,6 +633,31 @@ namespace Jigu
             StartBackgroundWork();
             StartInit();
             StartWatchdog();
+            StartRecheckTimer();
+        }
+
+        /// <summary>
+        /// 常驻时的周期性复查。程序可以最小化到托盘待很久，只在启动查一次会长期漏掉新版本。
+        /// 用 System.Threading.Timer（线程池）而不是 WinForms 的 Timer：SilentUpdate 里有
+        /// 阻塞的网络 IO 和语料重载，放界面线程上会卡住界面。
+        /// </summary>
+        private void StartRecheckTimer()
+        {
+            try
+            {
+                _recheck = new System.Threading.Timer(delegate
+                {
+                    try
+                    {
+                        // 正在退出或正在替换文件时不做任何网络工作
+                        if (_reallyExit || IsDisposed || _appPhase == "applying") return;
+                        SilentUpdate();
+                    }
+                    catch (Exception ex) { Log.Error("recheck", ex); }
+                }, null, RecheckIntervalMs, RecheckIntervalMs);
+                Log.Write("recheck timer started: every " + (RecheckIntervalMs / 3600000) + "h");
+            }
+            catch (Exception ex) { Log.Error("StartRecheckTimer", ex); }
         }
 
         /// <summary>
@@ -897,10 +950,19 @@ namespace Jigu
 
         internal string RunDataCheck(bool apply)
         {
+            // 只有真正要写盘的这一路才排队；只读的检查不必挡着别人。
+            // 门必须用 Interlocked 抢，「抢不到」的那一路**绝不能**去清标志：
+            // 标志是持有者设的，替它清掉等于当场放行下一个调用，于是两个线程
+            // 同时跑 DataUpdater.Apply，各自持一份内存副本重写同一个 corpus.json。
+            bool held = false;
+            if (apply)
+            {
+                if (Interlocked.CompareExchange(ref _updateGate, 1, 0) != 0)
+                    return "{\"busy\":true,\"message\":\"正在更新，请稍候\"}";
+                held = true;
+            }
             try
             {
-                if (_updateBusy) return "{\"busy\":true,\"message\":\"正在更新，请稍候\"}";
-                if (apply) _updateBusy = true;
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
                 DataUpdater.Report r = DataUpdater.Check(baseDir);
                 // 门槛必须同时看「史料变化」与「平文件变化」：只看 Changed 会让
@@ -908,7 +970,10 @@ namespace Jigu
                 if (apply && r.Checked && (r.Changed.Count > 0 || r.FilesChanged.Count > 0))
                 {
                     r = DataUpdater.Apply(baseDir, r);
-                    if (r.Merged.Count > 0)
+                    // 门槛必须和上面那道一致：只看 Merged 会把「只更新了 labels.json /
+                    // stopwords.json」的更新挡在重建之外 —— 磁盘上的表已经是新的，内存里
+                    // 的 _corpus 还是旧的，标签检索要等下次启动才生效。
+                    if (r.Merged.Count > 0 || r.FilesUpdated.Count > 0)
                     {
                         Corpus fresh = new Corpus();
                         fresh.LoadFrom(baseDir);
@@ -924,7 +989,7 @@ namespace Jigu
                 Log.Error("RunDataCheck", ex);
                 return "{\"checked\":false,\"message\":\"更新未完成，继续使用本地史料\"}";
             }
-            finally { _updateBusy = false; }
+            finally { if (held) Interlocked.Exchange(ref _updateGate, 0); }
         }
 
         private static string DataReportJson(DataUpdater.Report r, bool applied)
@@ -942,66 +1007,301 @@ namespace Jigu
         }
 
         // ================= 程序本体更新 =================
+        //
+        // 分两段，为的是不让用户干等下载：
+        //   1) 后台线程：检查 + 静默预下载（不提示任何东西）→ 就绪
+        //   2) 就绪后才弹一次「已下载完成，现在重启更新吗？」→ 应用，或留到下次启动
+        // 点「稍后」不清 pending：下次启动会由 FindPending 重新发现并再问一次。
+        //
+        // 状态放在 _appPhase / _appReady 上而不是局部变量里：下载在后台线程跑，
+        // 而确认框、按钮、轮询都在界面线程上。
 
-        internal string RunAppCheck(bool download, bool skipPrompt)
+        /// <summary>常驻时的复查间隔。程序能最小化到托盘待很久，启动只查一次会长期漏掉新版本。</summary>
+        private const int RecheckIntervalMs = 6 * 60 * 60 * 1000;
+
+        /// <summary>
+        /// 更新操作的命名互斥量：多开时只让一个实例下载/替换同一个安装目录。
+        /// 名字由安装目录推出，装在不同路径的副本互不影响。
+        /// </summary>
+        private static Mutex AcquireUpdateLock(string baseDir)
         {
             try
             {
-                AppUpdater.Report r = AppUpdater.Check();
-                if (!download || !r.Available) return AppReportJson(r, false, r.Message);
-                if (!skipPrompt && !AppUpdater.AskUser(r)) return AppReportJson(r, false, "已取消更新");
+                string key = Net.Sha256Hex(Encoding.UTF8.GetBytes(
+                    baseDir.TrimEnd('\\').ToLowerInvariant()));
+                Mutex m = new Mutex(false, "Local\\JiguUpdate-" + key.Substring(0, 16));
+                bool got;
+                try { got = m.WaitOne(0); }
+                catch (AbandonedMutexException) { got = true; }   // 上一个持有者崩了，归我们
+                if (!got) { m.Dispose(); return null; }
+                return m;
+            }
+            catch (Exception ex) { Log.Error("AcquireUpdateLock", ex); return null; }
+        }
 
-                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string pkg = AppUpdater.Download(baseDir, r, null);
-                if (pkg == null) return AppReportJson(r, false, "下载失败，请稍后重试");
-                if (!AppUpdater.LaunchReplace(baseDir, pkg))
-                    return AppReportJson(r, false, "无法启动更新程序");
+        /// <summary>
+        /// 放掉 AcquireUpdateLock 拿到的锁。只在「不打算马上退出」的失败路径上调用 ——
+        /// 成功路径靠进程退出释放，这里再放一次反而会让另一个实例插进替换过程中间。
+        /// </summary>
+        private static void ReleaseUpdateLock(Mutex m)
+        {
+            if (m == null) return;
+            try { m.ReleaseMutex(); }
+            catch (Exception ex) { Log.Error("ReleaseUpdateLock", ex); }
+            try { m.Dispose(); } catch { }
+        }
 
-                Log.Write("app update: closing for hot swap");
-                BeginInvoke((MethodInvoker)delegate
+        /// <summary>静默更新：先数据，再检查程序本体的新版本并后台预下载。全程不打扰用户。</summary>
+        private void SilentUpdate()
+        {
+            // 启动那次与定时复查可能撞车；重叠没有意义，让后来者直接退出
+            if (Interlocked.CompareExchange(ref _checking, 1, 0) != 0) return;
+            try
+            {
+                // 每轮开头丢掉 Release 缓存，好让史料与程序两次检查共用一次 API 请求
+                UpdateSource.Reset();
+                RunDataCheck(true);
+
+                if (_appReady != null) return;             // 已经有下好的包，不必再查
+                AppUpdater.Report app = AppUpdater.Check();
+                if (app.Checked && app.Available)
                 {
-                    try { _reallyExit = true; Close(); } catch { }
-                });
-                return AppReportJson(r, true, "正在更新并重启…");
+                    Log.Write("app update available: v" + app.RemoteVersion + "，开始后台下载");
+                    DownloadAppInBackground(app);
+                }
+            }
+            catch (Exception ex) { Log.Error("SilentUpdate", ex); }
+            finally { Interlocked.Exchange(ref _checking, 0); }
+        }
+
+        /// <summary>后台把新版本下到 pending/。下载期间界面照常可用，完成才通知用户。</summary>
+        private void DownloadAppInBackground(AppUpdater.Report r)
+        {
+            // 已经在下了就别再起一个：命名互斥量能挡住第二个线程，但它会把阶段打回
+            // idle，界面上的进度就此断掉。这里直接挡在最前面。
+            if (_appPhase == "downloading") return;
+
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            _appPhase = "downloading";
+            _appProgress = 0;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Mutex guard = AcquireUpdateLock(baseDir);
+                if (guard == null)
+                {
+                    // 另一个实例正在处理同一个安装目录：静默退让，它下好后大家共享
+                    Log.Write("app download skipped: 另一个实例正在更新");
+                    _appPhase = "idle";
+                    return;
+                }
+                try
+                {
+                    string pkg = AppUpdater.Download(baseDir, r, delegate(int p) { _appProgress = p; });
+                    if (pkg == null || !AppUpdater.WritePendingMeta(baseDir, r, pkg))
+                    {
+                        Log.Write("app download failed: v" + r.RemoteVersion);
+                        // 半截包必须清掉：否则下次启动会把它当成一个有效的待应用更新
+                        AppUpdater.DeletePending(baseDir);
+                        _appPhase = "idle";
+                        return;
+                    }
+                    SetAppUpdateReady(r, pkg);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("DownloadAppInBackground", ex);
+                    _appPhase = "idle";
+                }
+                finally
+                {
+                    try { guard.ReleaseMutex(); } catch { }
+                    guard.Dispose();
+                }
+            });
+        }
+
+        /// <summary>标记「已下载待重启」，并在界面线程弹一次确认框</summary>
+        private void SetAppUpdateReady(AppUpdater.Report r, string pkg)
+        {
+            lock (_appGate) { _appReady = r; _appReadyPkg = pkg; }
+            _appPhase = "ready";
+            _appProgress = 0;
+            Log.Write("app update ready: v" + r.RemoteVersion + " -> " + pkg);
+            try { BeginInvoke((MethodInvoker)delegate { PromptReadyUpdate(); }); }
+            catch (Exception ex) { Log.Error("SetAppUpdateReady", ex); }
+        }
+
+        /// <summary>就绪提示（界面线程）。同一个版本只主动弹一次，用户点过「稍后」的不再弹。</summary>
+        private void PromptReadyUpdate()
+        {
+            AppUpdater.Report r;
+            lock (_appGate) { r = _appReady; }
+            if (r == null) return;
+            if (string.Equals(_appNotified, r.RemoteVersion, StringComparison.OrdinalIgnoreCase)) return;
+            if (string.Equals(_appSnoozed, r.RemoteVersion, StringComparison.OrdinalIgnoreCase)) return;
+            _appNotified = r.RemoteVersion;
+            if (AppUpdater.AskUser(r)) ApplyReadyUpdate();
+        }
+
+        /// <summary>应用已下载的包：拉起替换助手 → 真正退出 → 由助手换文件并重启</summary>
+        private bool ApplyReadyUpdate()
+        {
+            string pkg;
+            lock (_appGate) { pkg = _appReadyPkg; }
+            if (string.IsNullOrEmpty(pkg))
+            {
+                Log.Write("apply skipped: 没有待应用的包");
+                return false;
+            }
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+
+            // 成功路径故意不释放：本进程马上就会退出，退出即释放。这样才能挡住另一个实例
+            // 在文件替换进行到一半时也去写同一个安装目录。
+            // 但失败路径必须放掉 —— 助手没拉起来就没有「进程马上退出」这回事，一直扣着锁
+            // 会让本会话之后所有更新都在这里静默跳过，别的实例也被挡在门外。
+            Mutex updateLock = AcquireUpdateLock(baseDir);
+            if (updateLock == null)
+            {
+                Log.Write("apply skipped: 另一个实例正在更新");
+                return false;
+            }
+            _appPhase = "applying";
+            if (!AppUpdater.LaunchReplace(baseDir, pkg))
+            {
+                ReleaseUpdateLock(updateLock);
+                _appPhase = "ready";
+                return false;
+            }
+            Log.Write("app update: closing for hot swap");
+            BeginInvoke((MethodInvoker)delegate { try { _reallyExit = true; Close(); } catch { } });
+            return true;
+        }
+
+        /// <summary>桥接用：应用已就绪的更新，返回 JSON 结果</summary>
+        internal string ApplyReadyUpdateJson()
+        {
+            if (_appPhase != "ready")
+                return "{\"phase\":\"" + Json.Escape(_appPhase) + "\",\"updating\":false,"
+                    + "\"message\":\"没有待应用的更新\"}";
+            bool ok = ApplyReadyUpdate();
+            return "{\"phase\":\"" + Json.Escape(_appPhase) + "\",\"updating\":"
+                + (ok ? "true" : "false") + ",\"message\":\""
+                + (ok ? "正在更新并重启…" : "暂时无法更新（可能有另一个实例正在更新），请稍后重试")
+                + "\"}";
+        }
+
+        internal void SnoozeAppUpdate(string version)
+        {
+            _appSnoozed = version == null ? "" : version.Trim();
+            Log.Write("app update snoozed: " + _appSnoozed);
+        }
+
+        /// <summary>只检查、不下载（界面上的「检查版本」）</summary>
+        internal string RunAppCheck()
+        {
+            try
+            {
+                UpdateSource.Reset();
+                AppUpdater.Report r = AppUpdater.Check();
+                string msg = r.Message;
+                if (r.Available && _appPhase == "ready") msg = "新版本 v" + r.RemoteVersion + " 已下载，重启后生效";
+                return AppReportJson(r, _appPhase, msg);
             }
             catch (Exception ex)
             {
                 Log.Error("RunAppCheck", ex);
-                return "{\"checked\":false,\"message\":\"更新检查失败\"}";
+                return "{\"checked\":false,\"phase\":\"idle\",\"message\":\"更新检查失败\"}";
             }
         }
 
-        private static string AppReportJson(AppUpdater.Report r, bool updating, string message)
+        /// <summary>界面上的「立即更新」：已就绪就直接应用，否则检查并转后台下载</summary>
+        internal string RunAppUpdate()
         {
-            StringBuilder sb = new StringBuilder(256);
+            try
+            {
+                if (_appPhase == "ready")
+                {
+                    bool ok = ApplyReadyUpdate();
+                    return "{\"checked\":true,\"available\":true,\"updating\":" + (ok ? "true" : "false")
+                        + ",\"phase\":\"" + Json.Escape(_appPhase) + "\",\"message\":\""
+                        + (ok ? "正在更新并重启…" : "暂时无法更新（可能有另一个实例正在更新），请稍后重试")
+                        + "\"}";
+                }
+
+                UpdateSource.Reset();
+                AppUpdater.Report r = AppUpdater.Check();
+                if (!r.Available) return AppReportJson(r, "idle", r.Message);
+                DownloadAppInBackground(r);
+                return AppReportJson(r, "downloading", "正在后台下载更新…");
+            }
+            catch (Exception ex)
+            {
+                Log.Error("RunAppUpdate", ex);
+                return "{\"checked\":false,\"phase\":\"idle\",\"message\":\"更新失败\"}";
+            }
+        }
+
+        /// <summary>供自动化测试：不弹窗，同步走完 检查→下载→替换</summary>
+        internal string ForceAppUpdate()
+        {
+            try
+            {
+                UpdateSource.Reset();
+                AppUpdater.Report r = AppUpdater.Check();
+                if (!r.Available) return AppReportJson(r, "idle", r.Message);
+
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string pkg = AppUpdater.Download(baseDir, r, null);
+                if (pkg == null) return AppReportJson(r, "idle", "下载失败，请稍后重试");
+                AppUpdater.WritePendingMeta(baseDir, r, pkg);
+                lock (_appGate) { _appReady = r; _appReadyPkg = pkg; }
+                _appNotified = r.RemoteVersion;   // 测试路径不弹框
+                _appPhase = "ready";
+                if (!ApplyReadyUpdate()) return AppReportJson(r, "ready", "无法启动更新程序");
+                return AppReportJson(r, "applying", "正在更新并重启…");
+            }
+            catch (Exception ex)
+            {
+                Log.Error("ForceAppUpdate", ex);
+                return "{\"checked\":false,\"phase\":\"idle\",\"message\":\"更新检查失败\"}";
+            }
+        }
+
+        /// <summary>当前更新状态，供界面轮询渲染（幂等，不需要"消费"标志）</summary>
+        internal string UpdateStateJson()
+        {
+            AppUpdater.Report r;
+            lock (_appGate) { r = _appReady; }
+            StringBuilder sb = new StringBuilder(320);
+            sb.Append("{\"phase\":\"").Append(Json.Escape(_appPhase)).Append('"');
+            sb.Append(",\"progress\":").Append(_appProgress);
+            sb.Append(",\"ready\":").Append(r != null ? "true" : "false");
+            // 只有「用户忽略的正是当前这一版」才算忽略。前端拿它挡横幅和「稍後」按钮，
+            // 一旦这里含糊成「被忽略过」，下一版就再也不会提醒用户了。
+            sb.Append(",\"snoozed\":").Append(
+                r != null && string.Equals(_appSnoozed, r.RemoteVersion, StringComparison.OrdinalIgnoreCase)
+                    ? "true" : "false");
+            sb.Append(",\"localVersion\":\"").Append(Json.Escape(AppVer.Number)).Append('"');
+            sb.Append(",\"remoteVersion\":\"").Append(Json.Escape(r == null ? "" : r.RemoteVersion)).Append('"');
+            sb.Append(",\"notes\":\"").Append(Json.Escape(r == null ? "" : r.Notes)).Append('"');
+            sb.Append(",\"message\":\"").Append(Json.Escape(r == null
+                ? (_appPhase == "downloading" ? ("正在后台下载 v" + _appProgress + "%") : "")
+                : ("新版本 v" + r.RemoteVersion + " 已下载，重启后生效"))).Append("\"}");
+            return sb.ToString();
+        }
+
+        private static string AppReportJson(AppUpdater.Report r, string phase, string message)
+        {
+            StringBuilder sb = new StringBuilder(320);
             sb.Append("{\"checked\":").Append(r.Checked ? "true" : "false");
             sb.Append(",\"available\":").Append(r.Available ? "true" : "false");
-            sb.Append(",\"updating\":").Append(updating ? "true" : "false");
+            sb.Append(",\"updating\":").Append(phase == "applying" ? "true" : "false");
+            sb.Append(",\"phase\":\"").Append(Json.Escape(phase)).Append('"');
             sb.Append(",\"localVersion\":\"").Append(Json.Escape(r.LocalVersion)).Append('"');
             sb.Append(",\"remoteVersion\":\"").Append(Json.Escape(r.RemoteVersion)).Append('"');
             sb.Append(",\"notes\":\"").Append(Json.Escape(r.Notes)).Append('"');
             sb.Append(",\"message\":\"").Append(Json.Escape(message)).Append("\"}");
             return sb.ToString();
-        }
-
-        /// <summary>启动后台任务：静默更新史料；发现新版本程序才询问用户</summary>
-        private void SilentUpdate()
-        {
-            try
-            {
-                RunDataCheck(true);
-                AppUpdater.Report app = AppUpdater.Check();
-                if (app.Checked && app.Available)
-                {
-                    Log.Write("startup app update: " + app.RemoteVersion);
-                    BeginInvoke((MethodInvoker)delegate
-                    {
-                        try { RunAppCheck(true, false); }
-                        catch (Exception ex) { Log.Error("app update prompt", ex); }
-                    });
-                }
-            }
-            catch { }
         }
 
         // ================= 失败页（古风，只出现一次，不递归） =================
@@ -1268,13 +1568,26 @@ namespace Jigu
 
             public string CheckDataUpdate() { return _form.RunDataCheck(false); }
             public string ApplyDataUpdate() { return _form.RunDataCheck(true); }
-            public string CheckAppUpdate() { return _form.RunAppCheck(false, true); }
-            public string StartAppUpdate() { return _form.RunAppCheck(true, false); }
+            public string CheckAppUpdate() { return _form.RunAppCheck(); }
+            /// <summary>「立即更新」：已下载好就直接应用并重启，否则转后台下载</summary>
+            public string StartAppUpdate() { return _form.RunAppUpdate(); }
+
+            /// <summary>当前更新状态（阶段 / 进度 / 待重启的版本），界面轮询用</summary>
+            public string GetUpdateState() { return _form.UpdateStateJson(); }
+
+            /// <summary>应用已经下载好的更新并重启</summary>
+            public string ApplyReadyUpdate()
+            {
+                return _form.ApplyReadyUpdateJson();
+            }
+
+            /// <summary>用户点了「稍后」：本轮不再提示这个版本</summary>
+            public void SnoozeUpdate(string version) { _form.SnoozeAppUpdate(version); }
 
             /// <summary>供自动化测试：跳过询问框直接执行热替换</summary>
             public string ForceAppUpdate()
             {
-                return _form.RunAppCheck(true, true);
+                return _form.ForceAppUpdate();
             }
 
             public void ShowDataFolder()

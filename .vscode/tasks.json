@@ -1,0 +1,71 @@
+// FILE: jigu-app/.vscode/tasks.json
+//
+// 发布流的下半段就摆在这里：在「源代码管理」面板提交并同步，然后
+// Ctrl+Shift+P -> Tasks: Run Task -> 「稽古: 发布新版本」。
+//
+// 真正干活的脚本是 tools\release.ps1（用法与每一步的取舍都在它的开头注释里），
+// 这个文件只负责把几种常用用法列进 VS Code 的任务列表。
+// 不依赖 npm：这个项目没有 package.json，也没有 Node 构建。
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // 日常就点这一条：用 build.ps1 顶部当前的版本号发布。
+      // 工作区有未提交的改动时会停下来，提醒你先在源代码管理面板提交。
+      "label": "稽古: 发布新版本（打 tag → CI 构建发布）",
+      "detail": "tools\\release.ps1 —— 校验 → git push main → 打并推 tag v<版本号> → CI 接管",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}\\tools\\release.ps1"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true, "echo": true },
+      "problemMatcher": []
+    },
+    {
+      // 忘了改版本号时用这条：自动 +1 修订号、提交这一次改动、再发布。
+      "label": "稽古: 发布 · 自动 +1 修订号",
+      "detail": "tools\\release.ps1 -Bump patch",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}\\tools\\release.ps1", "-Bump", "patch"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true, "echo": true },
+      "problemMatcher": []
+    },
+    {
+      // 想先看看会发生什么，就跑这条：只做检查、只打印，不改任何东西、不推任何东西。
+      "label": "稽古: 发布 · 预演（只检查，不改动）",
+      "detail": "tools\\release.ps1 -DryRun -AllowDirty",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}\\tools\\release.ps1", "-DryRun", "-AllowDirty"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true, "echo": true },
+      "problemMatcher": []
+    },
+    {
+      // 打 tag 之前先在本地 build.ps1 + --selfcheck 走一遍，
+      // 省掉一次「推完等 5 分钟才发现编译不过」的往返。CI 仍然会自检一次。
+      "label": "稽古: 发布 · 先本地构建自检",
+      "detail": "tools\\release.ps1 -Build",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}\\tools\\release.ps1", "-Build"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true, "echo": true },
+      "problemMatcher": []
+    },
+    {
+      // Ctrl+Shift+B。只构建、不发布，随便按。
+      "label": "稽古: 构建（build.ps1）",
+      "detail": "编译出 dist\\稽古\\，不碰 git",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}\\build.ps1"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true, "echo": true },
+      "problemMatcher": []
+    }
+  ]
+}

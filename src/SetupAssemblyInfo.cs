@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyProduct("稽古")]
 [assembly: AssemblyCompany("稽古")]
 [assembly: AssemblyCopyright("稽古 · 本地史镜检索")]
-[assembly: AssemblyVersion("1.3.0.0")]
-[assembly: AssemblyFileVersion("1.3.0.0")]
+// 版本号来自 build.ps1 生成的 Jigu.BuildInfo（src/Version.g.cs），与主程序同源。
+[assembly: AssemblyVersion(Jigu.BuildInfo.Version)]
+[assembly: AssemblyFileVersion(Jigu.BuildInfo.Version)]
 [assembly: ComVisible(false)]

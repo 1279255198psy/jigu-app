@@ -6,9 +6,16 @@ using System.Text;
 
 internal static class BraceFind
 {
+    /// <summary>仓库根目录：探针 exe 就放在 &lt;root&gt;\tests\ 下，别写死本机的绝对路径。</summary>
+    private static string RepoRoot()
+    {
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+    }
+
     private static int Main(string[] args)
     {
-        string path = args.Length > 0 ? args[0] : @"D:\DSH\jigu-app\web\styles.css";
+        string path = args.Length > 0 ? args[0]
+            : Path.Combine(RepoRoot(), "web", "styles.css");
         string[] lines = File.ReadAllLines(path, Encoding.UTF8);
         Console.OutputEncoding = Encoding.UTF8;
 

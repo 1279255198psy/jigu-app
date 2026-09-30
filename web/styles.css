@@ -665,6 +665,7 @@ button.link {
   border-radius: 3px;
   font-size: 14px;
   color: var(--ink-soft);
+  white-space: pre-wrap;
 }
 
 /* ---------- 窄窗口 ---------- */

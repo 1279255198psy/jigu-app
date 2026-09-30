@@ -19,18 +19,35 @@ internal static class InstallerLogicCheck
 
     private static int Main(string[] args)
     {
-        string work = args.Length > 0 ? args[0] : @"D:\DSH\jigu-app\testinstall";
+        // args[0] = 沙箱工作目录（本程序往里写 .lnk / 报告），args[1] = 要检查的应用目录。
+        // 两者分开：以前合成一个，于是要么把报告和快捷方式写进交付目录，要么拿沙箱去
+        // 当"已安装目录"检查，怎么选都不对。args[1] 省略时沿用旧行为（等于 args[0]）。
+        // 默认值不再写死某台机器的绝对路径 —— 换台机器/换了目录名就会指向不存在的树。
+        string work = args.Length > 0
+            ? args[0]
+            : Path.Combine(Path.GetTempPath(), "jigu-installer-logic");
+        string appDir = args.Length > 1 ? args[1] : work;
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+        try { Directory.CreateDirectory(work); } catch { }
 
         Say("== 安装器逻辑校验 ==");
         Say("工作目录: " + work);
+        Say("应用目录: " + appDir);
         Say("");
+
+        // 图标名带版本号（Windows 按路径缓存图标，换版本必须换路径），不能写死 ——
+        // 写死了版本一升就永远 FAIL，真问题反而被淹掉。到应用目录里找那个版本化图标。
+        // 旧的无版本 Jigu.ico 是 build.ps1 明确要清掉的，不该再期待它存在。
+        string[] iconFiles = Directory.Exists(appDir)
+            ? Directory.GetFiles(appDir, "Jigu-*.ico")
+            : new string[0];
 
         // ---------- 1. 快捷方式 ----------
         Say("--- 1. 桌面快捷方式创建 ---");
         string lnk = Path.Combine(work, "_check_desktop.lnk");
-        string target = Path.Combine(work, "稽古.exe");
-        string icon = Path.Combine(work, "Jigu.ico");
+        string target = Path.Combine(appDir, "稽古.exe");
+        string icon = iconFiles.Length > 0 ? iconFiles[0] : Path.Combine(appDir, "Jigu.ico");
+        string iconName = Path.GetFileName(icon);
         if (CreateShortcut(lnk, target, work, icon))
         {
             Say("  已创建: " + lnk + " (" + new FileInfo(lnk).Length + " B)");
@@ -42,7 +59,10 @@ internal static class InstallerLogicCheck
                 Say("  IconLocation     = " + i);
                 if (!string.Equals(t, target, StringComparison.OrdinalIgnoreCase)) Fail("目标路径不符");
                 if (!string.Equals(w, work, StringComparison.OrdinalIgnoreCase)) Fail("工作目录不符");
-                if (i.IndexOf("Jigu.ico", StringComparison.OrdinalIgnoreCase) < 0) Fail("图标未指向 Jigu.ico");
+                if (i.IndexOf(iconName, StringComparison.OrdinalIgnoreCase) < 0)
+                    Fail("图标未指向 " + iconName);
+
+                // 目标 exe 存在才谈得上装好了；便携/交付目录里 稽古.exe 就在根下
                 if (!File.Exists(target)) Fail("目标 exe 不存在: " + target);
             }
             else Fail("无法读回快捷方式");
@@ -100,20 +120,36 @@ internal static class InstallerLogicCheck
 
         Say("");
         Say("--- 3. 已安装目录完整性 ---");
-        string exe = Path.Combine(work, "稽古.exe");
-        string unins = Path.Combine(work, "稽古-卸载.exe");
-        string[] need = { "稽古.exe", "稽古-卸载.exe", "Jigu.ico", "使用说明.txt",
+        string exe = Path.Combine(appDir, "稽古.exe");
+        string unins = Path.Combine(appDir, "稽古-卸载.exe");
+        string[] need = { "稽古.exe", "使用说明.txt",
                           "Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll",
                           "WebView2Loader.dll", "data_base.txt",
-                          "data\\version.json", "data\\00_种子.json", "data\\01_先秦秦汉.json",
+                          "data\\00_种子.json", "data\\01_先秦秦汉.json",
                           "data\\02_三国两晋.json", "data\\03_隋唐五代.json", "data\\04_两宋.json",
                           "data\\05_明.json", "data\\06_清.json" };
+        // data\version.json 是旧布局的残留：build.ps1 合并语料时显式跳过它、并把它列进
+        // junk 清单，也就是说当前产品就是不带这个文件的，这里不能再要求它。
         foreach (string n in need)
         {
-            string p = Path.Combine(work, n);
+            string p = Path.Combine(appDir, n);
             if (File.Exists(p)) Say("  OK   " + n.PadRight(38) + new FileInfo(p).Length + " B");
             else Fail("缺少: " + n);
         }
+        if (iconFiles.Length == 1)
+            Say("  OK   " + Path.GetFileName(iconFiles[0]).PadRight(38)
+                + new FileInfo(iconFiles[0]).Length + " B");
+        else if (iconFiles.Length == 0)
+            Fail("缺少版本化图标 Jigu-*.ico");
+        else
+            Fail("有 " + iconFiles.Length + " 个 Jigu-*.ico（旧版本图标没清干净）");
+
+        // 卸载程序由安装向导在安装时生成，便携目录里本来就没有 —— 所以只在真的缺 exe
+        // 时报错，缺卸载程序只作提示，别把便携目录误判成安装损坏。
+        if (!File.Exists(exe) && !File.Exists(unins))
+            Fail("既没有 稽古.exe 也没有 稽古-卸载.exe，这个目录不像是安装目录: " + work);
+        else if (!File.Exists(unins))
+            Say("  NOTE 无 稽古-卸载.exe（便携目录不带卸载程序，安装后才有）");
 
         // 卸载程序应与安装包同源（同一二进制）
         if (File.Exists(unins) && File.Exists(exe))

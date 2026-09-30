@@ -40,9 +40,12 @@ namespace Jigu
                         return;
                     }
                 }
-                int n = InstallerPayload.ExtractTo(dest);
-                Log.Write("extract-to " + dest + " : " + n + " files");
-                Environment.ExitCode = n > 0 ? 0 : 1;
+                int failed;
+                int n = InstallerPayload.ExtractTo(dest, out failed);
+                Log.Write("extract-to " + dest + " : " + n + " files, " + failed + " failed");
+                // 退出码 2 = 写了一部分但没写全。替换助手必须能区分「全好」与「半截」——
+                // 半截的安装目录重启起来是坏的，宁可让它报错也不要假装成功。
+                Environment.ExitCode = failed > 0 ? 2 : (n > 0 ? 0 : 1);
                 return;
             }
 
@@ -523,6 +526,27 @@ namespace Jigu
         }
 
         /// <summary>
+        /// 数一份语料里有多少条是重复的（按 title+original 判同一篇），total 为总条数。
+        /// 合并把键搞错时，唯一症状就是整份语料被原样追加一遍：条数变多、每条都是合法
+        /// JSON、哈希校验也全过。只看"条数有没有变少"是抓不住它的，所以单独数一次重复。
+        /// </summary>
+        private static int CountDuplicateDocs(string corpusPath, out int total)
+        {
+            int dup = 0, n = 0;
+            if (!File.Exists(corpusPath)) { total = 0; return 0; }
+            string text = JsonScan.Decode(File.ReadAllBytes(corpusPath));
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+            JsonScan.ForEachDocument(text, delegate(CorpusDoc doc, long start, long end)
+            {
+                n++;
+                string key = (doc.Title ?? "") + "\u0000" + (doc.Original ?? "");
+                if (!seen.Add(key)) dup++;
+            });
+            total = n;
+            return dup;
+        }
+
+        /// <summary>
         /// 更新模拟：把远端清单指向本地静态服务器，走完"检查->下载->校验->替换"。
         /// 用于在沙箱里验证热更新链路（不启动真实 GUI）。
         /// </summary>
@@ -550,6 +574,11 @@ namespace Jigu
                 // 同 Host.RunDataCheck：只看 Changed 会漏掉「只有平文件变化」的更新
                 if (d.Changed.Count > 0 || d.FilesChanged.Count > 0)
                 {
+                    // 更新前先数一遍。合并的语义是「用远端那一部替换本地的同名书」，
+                    // 它不该让整个语料变少 —— 变少就说明合并把别的书弄丢了。
+                    Corpus before = new Corpus();
+                    before.LoadFrom(baseDir);
+
                     d = DataUpdater.Apply(baseDir, d);
                     sb.AppendLine("数据应用 : merged=" + d.Merged.Count + " filesUpdated="
                         + d.FilesUpdated.Count + " failed=" + d.Failed.Count + " msg=" + d.Message);
@@ -561,7 +590,30 @@ namespace Jigu
                     Corpus c = new Corpus();
                     c.LoadFrom(baseDir);
                     sb.AppendLine("重载语料 : " + c.DocCount + " 条 / 同义词表 "
-                        + c.LabelCount + " 个标签");
+                        + c.LabelCount + " 个标签" + "（更新前 " + before.DocCount + " 条）");
+                    if (c.DocCount == 0)
+                    {
+                        fails++;
+                        sb.AppendLine("  FAIL 更新后一条语料都读不出来");
+                    }
+                    else if (c.DocCount < before.DocCount)
+                    {
+                        fails++;
+                        sb.AppendLine("  FAIL 更新后语料少了 "
+                            + (before.DocCount - c.DocCount) + " 条（"
+                            + before.DocCount + " -> " + c.DocCount
+                            + "）：按书合并丢了内容");
+                    }
+                    // 反过来也要查：合并按错键时语料会整份翻倍，条数只增不减，
+                    // 上面那条判断正好放它过去。
+                    int dupTotal, dups = CountDuplicateDocs(
+                        Path.Combine(baseDir, Corpus.DataFileName), out dupTotal);
+                    if (dups > 0)
+                    {
+                        fails++;
+                        sb.AppendLine("  FAIL 更新后语料有 " + dups + " 条重复（共 "
+                            + dupTotal + " 条）：合并按错了键，把整份又追加了一遍");
+                    }
                 }
 
                 // 2) 程序本体更新

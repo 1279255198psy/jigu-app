@@ -1,10 +1,13 @@
 # 稽古 · 二十四史情境检索（Windows 桌面版 0.1.0）
 
-用中文写下你的困境，本机检索 198 则史事（先秦 → 清），给出**最相似的三条**。
+用中文写下你的困境，本机检索 201 则史事（先秦 → 清），给出**最相似的三条**。
 **运行时不调用任何 AI 接口。**
 
 > 说明：当全库确实找不到第三条相关史料时，只返回能找到的条数，**不拿无关条目凑数**。
 > （实测「骨干员工要离职，留不住人」在补齐同义词前只能命中 2 条。）
+
+> 各版本改了什么见 [CHANGELOG.md](CHANGELOG.md)（也是自动更新弹窗里那段说明的来源）；
+> 发版流程见 [RELEASE.md](RELEASE.md)。
 
 ---
 
@@ -324,9 +327,10 @@ dist\稽古\               绿色版目录
   ├─ 稽古.exe            主程序（界面内嵌）
   ├─ corpus.json         外置史料（201 条，可被增量更新替换）
   ├─ data_version.json   本地数据版本清单
-  ├─ app_version.example.json  程序更新清单模板
-  ├─ update_base.txt     更新源地址
+  ├─ update_base.txt     程序更新源（默认 github:rdfghjgyuytytrudthgc/jigu-app）
+  ├─ data_base.txt       史料数据更新源（不配则跟随程序更新源）
   └─ data\               初始按史书分卷的 JSON（便于对照/编辑）
+dist\update\             更新通道产物（清单 + 语料 + 安装包副本，整个目录可直接上传）
 docs\更新服务托管说明.md   开发者布署更新文件的完整说明
 ```
 
@@ -354,28 +358,102 @@ docs\更新服务托管说明.md   开发者布署更新文件的完整说明
 
 见 `docs\更新服务托管说明.md`，要点：
 
-1. 把 `app_version.json`、`data_version.json`、安装包、`corpus.json` 传到任意静态空间
-   （GitHub Raw / 阿里云 OSS / Nginx 目录 / 内网共享均可，**不需要服务器程序**）；
-2. 发新版：改版本号 → 构建 → `Get-FileHash` 取 SHA-256 → 覆盖上传 `app_version.json`；
-3. 史料有变：上传新 `corpus.json` + 覆盖 `data_version.json`；
-4. 更新地址通过 `update_base.txt` 或 `JIGU_UPDATE_BASE` 环境变量指定，代码内无绝对路径。
+1. **默认什么都不用配**：更新源是 `github:rdfghjgyuytytrudthgc/jigu-app`，读的是最新
+   Release 的附件。打一个 tag（用 `tools\release.ps1`，见第七节），CI 就会把
+   `app_version.json`、`data_version.json`、
+   `corpus.json`、`labels.json`、`stopwords.json` 一起挂上去，程序本体与史料两条通道
+   立刻可用。**不需要服务器程序、不需要数据库**。
+2. **想自建镜像**：把这些文件传到任意静态空间（阿里云 OSS / Nginx 目录 / 内网共享均可），
+   把地址写进 exe 同目录的 `update_base.txt`（`https://…` 或 `file://…`），
+   `dist\update\` 整个目录就是现成的上传内容。
+3. **想给史料单独走一个源**（数据迭代频率远高于程序本体）：再放一个 `data_base.txt`。
+4. 更新地址优先级：`JIGU_UPDATE_BASE` → `update_base.txt` → 编译内默认值，
+   代码内无绝对路径。
+5. **热替换不会覆盖这两个文件**：安装目录里已有的 `update_base.txt` / `data_base.txt`
+   会被跳过，自定义源不会被静默改回默认值。
 
-**情境标签表与停用词表可以不走热更新**：两者都是外置优先、内嵌兜底，把新版直接放到 exe
-同目录，重启即生效，不必发版；也可以在 `data_version.json` 的 `files` 区段里下发
-（`files` 是整体替换的平文件，与 `books` 的「按书合并」不同）。
+**用户侧发生什么**：启动后台静默检查 → 悄悄下载好 → 才弹一次
+「新版本已下载完成，现在重启更新吗？」。用户点「稍后」或直接关掉，包会留着，
+下次启动再问。最小化到托盘常驻时每 6 小时复查一次。全程失败静默降级，不弹错误框。
+
+**情境标签表与停用词表不随包出厂**（外置优先、内嵌兜底），所以刚装好的程序会去源上
+取一次这两张表；之后想单独更新它们，既可以直接放到 exe 同目录重启生效，
+也可以在 `data_version.json` 的 `files` 区段里下发（`files` 是整体替换的平文件，
+与 `books` 的「按书合并」不同）。
 
 ---
 
 # 七、发版与自测命令
 
+**发布一条命令**：在 VS Code 的源代码管理面板提交并同步，然后跑任务
+**稽古: 发布新版本**（`Ctrl+Shift+P` → `Tasks: Run Task`），或者直接在终端：
+
+```powershell
+powershell -NoProfile -File tools\release.ps1            # 用 build.ps1 里当前的版本号发布
+powershell -NoProfile -File tools\release.ps1 -Bump patch  # 忘了改版本号时：+1、提交、发布
+powershell -NoProfile -File tools\release.ps1 -DryRun      # 只检查，什么都不改
+```
+
+脚本自己判断该不该发（分支、未提交改动、版本号、远端是否已有这个 tag），
+推 tag 之后由 CI 构建并发布。完整说明见 `RELEASE.md`，脚本的取舍见它开头的注释。
+
 | 命令 | 作用 |
 | --- | --- |
+| `tools\release.ps1` | **发布**：校验 → 推 `main` → 打并推 tag `v<版本号>` → CI 自动构建发布 |
 | `稽古.exe --selfcheck 报告.txt` | 界面资源 / 语料与同义词表 / **召回回归**（读内嵌的 `tests/cases.json`）/ 更新清单。**失败时退出码非 0** |
 | `稽古.exe --test-update <地址>` | 走完检查→下载→校验→解压替换全流程（不弹窗） |
 | `稽古.exe --built-in [url]` | 直接开内置 WinForms 界面（不碰 WebView2），用于诊断 |
 | `稽古.exe --web-fallback` | 把网页界面落盘并用系统浏览器打开（WebView2 完全不可用时的最后兜底） |
 | `JIGU_NO_BRIDGE=1 稽古.exe` | 强制跳过宿主桥注册，复验「离线模式降级」这条路径 |
 | `稽古-安装包.exe /silent /dir=<目录>` | 静默安装 |
-
 | `稽古-安装包.exe --extract-to <目录>` | 自解压（热替换使用） |
 | `稽古-卸载.exe /uninstall /silent` | 静默卸载 |
+
+`tests\` 下的独立探针（手工 `csc` 编译，不需要 GUI、不需要联网）：
+
+| 探针 | 作用 |
+| --- | --- |
+| `AssetCheck.exe <exe> <报告>` | 界面资源全部能从内存索引解析（防 `ERR_FILE_NOT_FOUND`） |
+| `JsSyntax.exe <项目根>` | 前端资源齐全、括号配平、关键函数齐备 |
+| `DataCheck.exe [根目录]` | 语料五要素齐全、标签齐备、UTF-8 中文完好 |
+| `PendingCheck.exe [exe]` | 待应用更新的跨会话判定：下好的包认得出，陈旧/损坏/半截包清得掉 |
+| `UpdateLockCheck.exe [exe]` | 多开时的更新互斥：同目录只让一个实例下载/替换，不同目录互不干扰 |
+| `IconCheck.exe <项目根>` | 图标是古风印章而非默认图标，且 exe／安装包／负载／交付目录四处一致 |
+| `InstallerLogicCheck.exe [沙箱目录] [应用目录]` | 快捷方式与卸载注册项读写、交付目录文件齐全（应用目录省略时沿用沙箱） |
+| `OffsetCheck.exe [corpus.json]` | 扫描器给的下标是**字符**下标，切片必须切同一个字符串 —— 单位搞错会把语料切坏 |
+| `ParseCheck.exe` | 解析层健壮性：带 BOM 的语料／标签照样解析；深嵌套降级成「解析失败」而不是爆栈杀进程 |
+| `UninstallCheck.exe` | 卸载判定：只有整目录都是我们的才敢整目录删；用户往里放过任何东西都退化成「只删我们的文件」 |
+
+`ParseCheck` 与 `OffsetCheck` 一样只依赖 `src\Json.cs` + `src\MiniJson.cs`：
+
+```
+csc -nologo -out:ParseCheck.exe ParseCheck.cs ..\src\Json.cs ..\src\MiniJson.cs
+```
+
+`UninstallCheck` 特殊一点：它要和**安装向导那一遍的源码**编在一起（要读真的载荷键表，
+并经反射调用 `UninstallForm` 的私有判定方法；`UninstallForm` 在 `JiguSetup` 命名空间，
+`InstallerPayload` 在 `Jigu`）：
+
+```
+csc -nologo -out:UninstallCheck.exe /main:Jigu.UninstallCheck UninstallCheck.cs ^
+    ..\src\Installer.cs ..\src\SetupAssemblyInfo.cs ..\src\Host.cs ..\src\Update.cs ^
+    ..\src\Json.cs ..\src\MiniJson.cs ..\src\Corpus.cs ..\src\PayloadExt.cs ^
+    ..\src\InstallerPayload.g.cs ..\src\EmbeddedAssets.g.cs ..\src\Version.g.cs ^
+    /reference:System.Windows.Forms.dll /reference:Microsoft.Web.WebView2.Core.dll ^
+    /reference:Microsoft.Web.WebView2.WinForms.dll
+```
+
+
+另外两条与热更新合并有关的回归手段：
+
+| 手段 | 作用 |
+| --- | --- |
+| `tests\make-merge-fixture.ps1` | 造一份**内容真的不同**的假远端（整份语料 + 一条按书下发的补遗，且文件名与书名故意不同） |
+| `tests\compile-check.sh` | 两遍 `csc`（主程序 / 安装向导）的快速编译校验，不必跑完整 `build.ps1` |
+
+> 夹具必须让语料**真的变化**再跑 `稽古.exe --test-update file:///<夹具>`：
+> 内容一模一样的话更新根本不会执行，合并里的问题就永远看不出来。
+> 判定标准是更新后条数不减少、**也不出现重复**（按错键时整份语料会被再追加一遍）。
+
+> `tests\*.exe` 与 `tests\` 下的 WebView2 DLL 都不进版本库（见 `.gitignore`）。
+> 源码改动后要**重新编译**再跑，否则跑的是旧断言 —— 这一点曾被旧二进制坑过。
