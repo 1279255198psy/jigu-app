@@ -356,6 +356,15 @@ namespace Jigu
         /// <summary>同上，另外带回失败原因 —— 只写日志，用来区分「断网」与「被 GitHub 限流」</summary>
         public static byte[] GetEx(WebClient client, string url, int timeoutMs, out string error)
         {
+            string reason = "";
+            byte[] bytes = OffUiThread<byte[]>(delegate() { return Fetch(client, url, timeoutMs, out reason); });
+            error = reason;
+            return bytes;
+        }
+
+        /// <summary>GetEx 的本体。不要直接调用 —— 它「发起异步再 WaitOne」，必须脱开 UI 线程的同步上下文。</summary>
+        private static byte[] Fetch(WebClient client, string url, int timeoutMs, out string error)
+        {
             error = "";
             if (string.IsNullOrEmpty(url)) { error = "空地址"; return null; }
 
@@ -397,6 +406,31 @@ namespace Jigu
             // 而这正是这个 out 参数存在的理由。
             if (failure != null) { error = Describe(failure); return null; }
             return result;
+        }
+
+        /// <summary>
+        /// 在「没有同步上下文」的状态下执行 work，结束后原样还原。
+        /// <para>
+        /// WebClient 的 *Async 系列把完成回调 Post 到**发起时**的 SynchronizationContext 上
+        /// （AsyncOperationManager 的默认行为），而 Fetch/安装包下载都是「发起异步 + 立刻
+        /// WaitOne」这种写法。平时这段代码跑在后台线程上（SilentUpdate），Current 是 null，
+        /// 回调走线程池，一切正常；可一旦跑在 WinForms 的 UI 线程上，Current 就是
+        /// WindowsFormsSynchronizationContext，回调被塞进消息队列，而消息泵此刻正被 WaitOne
+        /// 堵着 —— 回调永远执行不到，必然走到「超时」分支。
+        /// </para>
+        /// <para>
+        /// 这条路径是真实存在的：界面上的「检查版本」按钮经 WebView2 的宿主对象桥直达 UI 线程
+        /// （HostBridge.CheckAppUpdate -> RunAppCheck），于是**那个按钮在联网正常时也永远
+        /// 只报「未连上更新服务器」**，且耗时恰好等于超时值（实测 8014ms / 预期 8000ms）。
+        /// 断网与否都一样，跟代理、梯子、证书全无关系 —— 所以它看起来才那么像「连不上」。
+        /// </para>
+        /// </summary>
+        internal static T OffUiThread<T>(Func<T> work)
+        {
+            SynchronizationContext saved = SynchronizationContext.Current;
+            if (saved != null) SynchronizationContext.SetSynchronizationContext(null);
+            try { return work(); }
+            finally { if (saved != null) SynchronizationContext.SetSynchronizationContext(saved); }
         }
 
         /// <summary>把异常折成一句可读原因（含 HTTP 状态与限流余量）</summary>
@@ -1323,25 +1357,30 @@ namespace Jigu
                 {
                 WebClient c = Net.Client();
                 byte[] data = null;
-                // 先试流式下载（可报进度），失败退回一次性下载
-                try
+                // 先试流式下载（可报进度），失败退回一次性下载。
+                // 整段都套在 OffUiThread 里：DownloadFileAsync + WaitOne 是同一个坑，见那里的注释。
+                data = Net.OffUiThread<byte[]>(delegate()
                 {
-                    c.DownloadProgressChanged += delegate(object s, DownloadProgressChangedEventArgs e)
+                    try
                     {
-                        if (progress != null) progress(e.ProgressPercentage);
-                    };
-                    ManualResetEvent done = new ManualResetEvent(false);
-                    Exception err = null;
-                    c.DownloadFileCompleted += delegate(object s, System.ComponentModel.AsyncCompletedEventArgs e)
-                    { err = e.Error; done.Set(); };
-                    c.DownloadFileAsync(new Uri(r.Url), target);
-                    if (!done.WaitOne(180000) || err != null)
-                    {
-                        try { c.CancelAsync(); } catch { }
-                        data = Net.Get(Net.Client(), r.Url, 180000);
+                        c.DownloadProgressChanged += delegate(object s, DownloadProgressChangedEventArgs e)
+                        {
+                            if (progress != null) progress(e.ProgressPercentage);
+                        };
+                        ManualResetEvent done = new ManualResetEvent(false);
+                        Exception err = null;
+                        c.DownloadFileCompleted += delegate(object s, System.ComponentModel.AsyncCompletedEventArgs e)
+                        { err = e.Error; done.Set(); };
+                        c.DownloadFileAsync(new Uri(r.Url), target);
+                        if (!done.WaitOne(180000) || err != null)
+                        {
+                            try { c.CancelAsync(); } catch { }
+                            return Net.Get(Net.Client(), r.Url, 180000);
+                        }
+                        return null;
                     }
-                }
-                catch { data = Net.Get(Net.Client(), r.Url, 180000); }
+                    catch { return Net.Get(Net.Client(), r.Url, 180000); }
+                });
 
                 if (data != null) File.WriteAllBytes(target, data);
                 }
