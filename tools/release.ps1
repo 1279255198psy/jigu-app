@@ -10,13 +10,20 @@
 #              Ctrl+Shift+P -> "Tasks: Run Task" -> "Jigu: release".
 #
 # Usage (from the repository root, in any shell):
-#   powershell -NoProfile -File tools\release.ps1               # release the version in build.ps1
+#   powershell -NoProfile -File tools\release.ps1               # ASKS for the version, then releases
+#   powershell -NoProfile -File tools\release.ps1 -Version 0.2.0   # same, without the question
 #   powershell -NoProfile -File tools\release.ps1 -Bump patch   # +1 the version, commit it, release
 #   powershell -NoProfile -File tools\release.ps1 -Bump minor
-#   powershell -NoProfile -File tools\release.ps1 -Version 0.2.0
 #   powershell -NoProfile -File tools\release.ps1 -DryRun       # run every check, change nothing
 #   powershell -NoProfile -File tools\release.ps1 -Build        # build.ps1 + --selfcheck first
 #   powershell -NoProfile -File tools\release.ps1 -AllowDirty   # publish the committed revision
+#
+# Neither version source is the file any more. With no -Version and no -Bump the script asks
+# (Enter keeps build.ps1's number), and once the number is settled it writes it into build.ps1
+# AND renames the CHANGELOG heading to match, then commits both files itself. It has to: CI
+# builds the COMMIT, so a version bump or a heading rename left in the working tree would ship
+# a release whose tag and compiled-in version disagree -- the one failure mode that makes the
+# updater prompt forever.
 #
 # Three things this script deliberately will NOT do:
 #   * It never elevates. PUSH.cmd used to relaunch itself as administrator to comment out the
@@ -156,6 +163,9 @@ if ($current -notmatch '^\d+\.\d+\.\d+$') {
 }
 
 $target = $current
+# -Version "" (the VS Code task passes it when the prompt box is left empty) means "keep what
+# build.ps1 says" -- it is an answer, so do not turn around and ask the same question again.
+$answered = $PSBoundParameters.ContainsKey("Version")
 if ($Version) {
     if ($Version -notmatch '^\d+\.\d+\.\d+$') { Die ("-Version '" + $Version + "' is not of the form x.y.z") }
     $target = $Version
@@ -168,6 +178,16 @@ if ($Version) {
     elseif ($Bump -eq "minor") { $b = $b + 1; $c = 0 }
     else                       { $c = $c + 1 }
     $target = "$a.$b.$c"
+} elseif (-not $answered -and -not $DryRun) {
+    # Ask. The tree is clean by now (step 1 refuses otherwise), so this answer is the only
+    # thing that can move the version, and the user is the one who gets to decide it --
+    # RELEASE.md is explicit that the machine should not guess the number.
+    $answer = (Read-Host ("release version, as x.y.z  [Enter keeps " + $current + "]")).Trim()
+    if ($answer.StartsWith("v") -or $answer.StartsWith("V")) { $answer = $answer.Substring(1).Trim() }
+    if (-not [string]::IsNullOrEmpty($answer)) {
+        if ($answer -notmatch '^\d+\.\d+\.\d+$') { Die ("'" + $answer + "' is not of the form x.y.z") }
+        $target = $answer
+    }
 }
 $tag = "v" + $target
 Ok ("build.ps1 says " + $current + "  ->  release tag " + $tag)
@@ -205,46 +225,76 @@ if ($LASTEXITCODE -eq 0 -and $out.Count -gt 0) {
     }
 }
 
+# --- 3b. the update dialog text comes from CHANGELOG.md ---------------------------
+# release.yml takes the section whose heading is "## <version>" and writes it into
+# app_version.json's "notes" -- the text the user reads in the "a new version is ready"
+# dialog. A missing heading is not an error: notes quietly falls back to the last few
+# commit subjects, which is the wrong text but ships without complaining. So retitle the
+# section here, where it still costs nothing. The pattern is release.yml's:
+# ^##(?!#)\s*\[?v?<version>\b
+#
+# Both names are built from code points because this file must stay pure ASCII: PowerShell
+# 5.1 reads a BOM-less .ps1 as GBK and would mangle a literal. The unreleased heading is
+# U+672A U+53D1 U+5E03, and the em dash in the date suffix is U+2014.
+$unreleased = [string][char]0x672A + [string][char]0x53D1 + [string][char]0x5E03
+$emDash     = [string][char]0x2014
+$utf8NoBom  = New-Object System.Text.UTF8Encoding($false)
+$changelogPath = Join-Path $root "CHANGELOG.md"
+$changelogChanged = $false
+
+if (-not (Test-Path -LiteralPath $changelogPath)) {
+    Warn "no CHANGELOG.md -- the update dialog will show commit subjects, not release notes"
+} else {
+    $text = [System.IO.File]::ReadAllText($changelogPath, $utf8NoBom)
+    if ([regex]::IsMatch($text, '(?m)^##(?!#)[ \t]*\[?v?' + [regex]::Escape($target) + '\b')) {
+        Ok ("CHANGELOG.md already has a '" + $target + "' section -- it becomes the update dialog text")
+    } else {
+        $rx = New-Object System.Text.RegularExpressions.Regex (
+            '(?m)^##(?!#)[ \t]*' + [regex]::Escape($unreleased) + '[ \t]*\r?$')
+        $heading = "## " + $target + " " + $emDash + " " + [DateTime]::Now.ToString("yyyy-MM-dd")
+        if (-not $rx.IsMatch($text)) {
+            Warn ("CHANGELOG.md has neither a '" + $target + "' section nor a '" + $unreleased + "' heading -- the update dialog will fall back to commit subjects")
+        } elseif ($DryRun) {
+            Dry ("would retitle a CHANGELOG section to '" + $heading + "'")
+        } else {
+            [System.IO.File]::WriteAllText($changelogPath, $rx.Replace($text, $heading, 1), $utf8NoBom)
+            $changelogChanged = $true
+            Ok ("CHANGELOG.md '" + $unreleased + "' -> '" + $heading + "'")
+        }
+    }
+}
+
+# --- 3c. write the version down, then commit both files in ONE commit ---------------
+# One commit, not two: CI checks out the commit, so a version bump or a heading rename
+# left sitting in the working tree would ship a release whose tag and compiled-in version
+# disagree -- the one failure mode that makes the updater prompt forever.
+$buildChanged = $false
 if ($target -ne $current) {
     # Splice the version line in place: everything else in build.ps1 stays byte-identical.
     $newText = $buildText.Substring(0, $m.Index) + '$version = "' + $target + '"' +
                $buildText.Substring($m.Index + $m.Length)
     if ($DryRun) {
-        Dry ("would set build.ps1 to " + $target + " and commit it")
+        Dry ("would set build.ps1 to " + $target)
     } else {
-        [System.IO.File]::WriteAllText($buildPath, $newText, (New-Object System.Text.UTF8Encoding($false)))
-        & $git add -- build.ps1
-        if ($LASTEXITCODE -ne 0) { Die "git add build.ps1 failed" }
-        & $git commit -m ("release " + $tag)
-        if ($LASTEXITCODE -ne 0) { Die "git commit failed -- nothing was tagged" }
-        Ok ("build.ps1 " + $current + " -> " + $target + " (committed)")
+        [System.IO.File]::WriteAllText($buildPath, $newText, $utf8NoBom)
+        $buildChanged = $true
     }
 }
 
-# --- 3b. the update dialog text comes from CHANGELOG.md ---------------------------
-# release.yml takes the section whose heading is "## <version>" and writes it into
-# app_version.json's "notes" -- the text the user reads in the "a new version is ready"
-# dialog. A missing heading is NOT an error: notes quietly falls back to the last few
-# commit subjects, which is the wrong text but ships without complaining. Check it here,
-# where it costs nothing to fix, instead of finding out from a released dialog.
-# The heading pattern is the one release.yml uses: ^##(?!#)\s*\[?v?<version>\b
-$changelog = Join-Path $root "CHANGELOG.md"
-if (-not (Test-Path -LiteralPath $changelog)) {
-    Warn "no CHANGELOG.md -- the update dialog will show commit subjects, not release notes"
-} else {
-    $pattern = '^##(?!#)\s*\[?v?' + [System.Text.RegularExpressions.Regex]::Escape($target) + '\b'
-    $found = $false
-    foreach ($line in [System.IO.File]::ReadAllLines($changelog, (New-Object System.Text.UTF8Encoding($false)))) {
-        if ([System.Text.RegularExpressions.Regex]::IsMatch($line.Trim(), $pattern)) { $found = $true; break }
-    }
-    if ($found) {
-        Ok ("CHANGELOG.md has a '" + $target + "' section -- it becomes the update dialog text")
+$paths = @()
+if ($buildChanged)     { $paths += "build.ps1" }
+if ($changelogChanged) { $paths += "CHANGELOG.md" }
+
+if (-not $DryRun) {
+    if ($paths.Count -eq 0) {
+        Ok ("nothing to commit -- build.ps1 and CHANGELOG.md already describe " + $target)
     } else {
-        # The heading name is built from code points on purpose: this file must stay pure
-        # ASCII, because PowerShell 5.1 reads a BOM-less .ps1 as GBK and would mangle any
-        # literal CJK here. The three chars are U+672A U+53D1 U+5E03.
-        $unreleased = [string][char]0x672A + [string][char]0x53D1 + [string][char]0x5E03
-        Warn ("CHANGELOG.md has no '## " + $target + "' section -- the update dialog will fall back to commit subjects; rename the '## " + $unreleased + "' heading to '## " + $target + "' to ship your own text")
+        & $git add -- $paths
+        if ($LASTEXITCODE -ne 0) { Die ("git add failed: " + ($paths -join " ")) }
+        # Name the paths, so an -AllowDirty run cannot sweep up whatever else was staged.
+        & $git commit -m ("release " + $tag) -- $paths
+        if ($LASTEXITCODE -ne 0) { Die "git commit failed -- nothing was tagged" }
+        Ok (($paths -join " + ") + " committed as '" + $tag + "'")
     }
 }
 

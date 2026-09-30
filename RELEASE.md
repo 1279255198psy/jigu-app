@@ -11,7 +11,9 @@
 
 1. **提交**：源代码管理面板 → 写提交信息 → 提交 → 同步（把 `main` 推上去）。
 2. **发布**：`Ctrl+Shift+P` → `Tasks: Run Task` → **稽古: 发布新版本（打 tag → CI 构建发布）**。
-   等价于在终端里跑 `powershell -NoProfile -File tools\release.ps1`。
+   会先弹一个框问**这次发哪个版本号**，填 `x.y.z`（例如 `0.1.1`）；直接回车就用 `build.ps1`
+   当前那个数。之后它自己改文件、提交、推 `main`、打 tag。
+   等价于在终端里跑 `powershell -NoProfile -File tools\release.ps1`（没有 `-Version` 时会在终端里问同一句）。
 
 `tools\release.ps1` 依次做这几件事（下表就是脚本运行时打印的阶段名），
 **任何一步不过就停在那里，绝不带病往下走**：
@@ -20,7 +22,7 @@
 | --- | --- | --- |
 | `repository` | 确认在 `main`；检查**已跟踪**的文件都已提交（顺带把未跟踪的文件列出来给你看） | 不在 `main` 上；有未提交改动（CI 构建的是 commit，工作区改动不会进包）—— `-AllowDirty` 可明知故犯 |
 | `origin` | `git fetch`，确认连得上 GitHub、且本地 `main` 不落后于 `origin/main` | 连不上（脚本**绝不提权改 hosts**，只提示你自己跑 `fix-hosts.ps1`）；落后于远端 |
-| `version` | 从 `build.ps1` 读出 `$version` → tag `v<版本号>`；确认远端还没有这个 tag；带 `-Bump` / `-Version` 时改 `build.ps1` 并**自动提交这一次改动** | 版本号不是 `x.y.z`；远端已有同名 tag（说明版本号忘改了） |
+| `version` | 定版本号：`-Version` 给了就用它，`-Bump` 给了就 +1，都没有就**问你一次**（回车 = 沿用 `build.ps1` 当前值）→ tag `v<版本号>`；确认远端还没有这个 tag；把版本号写进 `build.ps1`，并把 `CHANGELOG.md` 里 `## 未发布` 的标题改成同号，然后**这两处一起提交** | 版本号不是 `x.y.z`；远端已有同名 tag（说明版本号忘改了） |
 | `local pre-flight` | 只有带 `-Build` 时走：本地 `build.ps1` + `--selfcheck` | 编译不过或自检不过 |
 | `push main` | `git push origin main` | 推送失败（网络 / hosts / 凭据），此时还没打 tag |
 | `tag` | `git tag -a v<版本号>` → `git push origin v<版本号>` | 推送失败；tag 已建在本地，修好原因再跑一次即可 |
@@ -63,18 +65,26 @@
 
 ---
 
-## 二、发布前必须做的一件事：改版本号
+## 二、版本号：发布时会问你，不用手工改文件
 
-### 1. 版本号只有一个真源
+### 1. 你只要回答一个问题
 
-改 `build.ps1` 顶部的 `$version` 就够了：
+发布那一步会问一次版本号。填 `x.y.z` 就用你填的，直接回车就沿用 `build.ps1` 当前那个数。
+
+**拿到了之后，`build.ps1` 和 `CHANGELOG.md` 的标题都由脚本改**，并和在一起提交 ——
+不用你去编辑器里动任何文件。顺序上它必须在打 tag 之前完成：CI 构建的是 commit，
+留在工作区里的改动不会进包，那就会出现「tag 是 `v0.1.1`、程序里认的还是 `0.1.0`」
+的死循环。
+
+不想被问就用参数直接指定：
 
 ```powershell
-$version = "0.1.0"      # ← 只改这里
+powershell -NoProfile -File tools\release.ps1 -Version 0.1.1   # 指定
+powershell -NoProfile -File tools\release.ps1 -Bump patch      # 让脚本 +1
 ```
 
-> 忘了改也能发：`tools\release.ps1 -Bump patch` 会自动 +1、提交这一次改动、再发布。
-> 但不建议把它当默认 —— 版本号该由你决定，不该由机器猜。
+> `-Bump` 会自动 +1 修订号，适合「懒得想数字」的时候。但不建议把它当默认 ——
+> 版本号该由你决定，不该由机器猜。
 
 构建时会生成 `src\Version.g.cs`，程序本体（`AppVer.Number`、用于自动更新的版本比对）
 与安装向导（`SetupInfo.Version`）都引用它。**不再需要手工同步多个文件**——
@@ -133,9 +143,10 @@ WebView2Loader.dll
 
 > `app_version.json` 的 `notes` 依次尝试：`CHANGELOG.md` 里该版本的小节 →
 > 上一个 tag 以来的提交标题 → 一行 `稽古 vX.Y.Z 发布`。
-> 仓库根目录已经有 `CHANGELOG.md` 了 —— **发版前把这一版的改动写进 `## 未发布` 一节，
-> 再把它改名为 `## x.y.z — 日期`**（与 `build.ps1` 的版本号一致，否则取不到，
-> `notes` 会悄悄退化成提交标题）。
+> 仓库根目录已经有 `CHANGELOG.md` 了 —— **把这一版的改动写进 `## 未发布` 一节就行，
+> 标题不用自己改**：`tools\release.ps1` 定好版本号之后会把 `## 未发布` 改成
+> `## x.y.z — 日期`（与 `build.ps1` 的版本号一致）并提交。
+> 没有 `## 未发布` 也没有对应版本的小节时，`notes` 会悄悄退化成提交标题。
 > 格式约束、600 字上限等写在 `CHANGELOG.md` 顶部，别只看这里。
 
 Release 正文是自动生成的固定内容（下载哪个、系统要求、校验方法、首次运行步骤，
@@ -168,13 +179,13 @@ CI 只是把这一步自动化了，不是必须的。
 | 现象 | 原因 / 处理 |
 | --- | --- |
 | `tools\release.ps1` 说 `the working tree has uncommitted changes` | 还有没提交的改动。CI 构建的是 commit，这些改动不会进包 —— 先在源代码管理面板提交；确实只想发已提交的那版就加 `-AllowDirty` |
-| 脚本说 `tag vX.Y.Z is already on origin` | 这个版本号已经发过。要发新版：`-Bump patch`，或改 `build.ps1` 顶部的版本号并提交 |
+| 脚本说 `tag vX.Y.Z is already on origin` | 这个版本号已经发过。要发新版：重跑时在框里填个更大的号，或用 `-Version 0.1.2` / `-Bump patch` |
 | 脚本 `warn` 说 origin 上还有一个不带 `v` 的 `0.1.0` | 本项目第一版是手工发的，tag 就叫 `0.1.0`（没带 `v`）。走新流程发的第一版请用 **`-Bump patch`（→ `0.1.1`）**，否则会出现两个共用 `0.1.0` 这个版本号的 Release，而自动更新读的是「最新」那一个 |
 | 脚本说 `git fetch failed` | 连不上 GitHub。这台机器上 `github.com` 被 hosts 指到了 `127.0.0.1`，跑**仓库外层**的 `fix-hosts.ps1 -Mode disable`（需要管理员权限，推完记得 `-Mode restore`）；是凭据问题的话，Git for Windows 会弹登录窗口 |
 | 脚本说 `local main is N commit(s) behind origin/main` | 远端有别的提交。先 `git pull --rebase origin main` 再来发 |
 | VS Code 的任务列表里没有「稽古: 发布」 | 工作区根目录不是仓库根。把 `jigu-app` 文件夹作为工作区打开；如果你打开的是外层壳，外层也有一份等价的 `.vscode\tasks.json` |
 | Actions 里没有跑 | tag 不是 `v*` 形式，或者 tag 推送时仓库里还没有 `.github/workflows/release.yml`（先推一次 `main`，再推 tag） |
-| `tag 'v1.7.0' 与 build.ps1 里的版本号不一致` | 忘了改 `build.ps1` 顶部的 `$version`。改好、提交，再重新打 tag（或从 Actions 页 `workflow_dispatch` 指定 tag 重跑） |
+| `tag 'v1.7.0' 与 build.ps1 里的版本号不一致` | tag 和程序里认的版本号对不上。走 `tools\release.ps1` 不会出现这种情况（它自己改 `build.ps1` 并提交）；手工打 tag 才会 —— 那就把 `build.ps1` 的 `$version` 改成与 tag 一致、提交，再从 Actions 页 `workflow_dispatch` 重跑 |
 | 用户端永远提示有新版本、装完还是旧版本号 | 同上：程序里认的版本号落后于 tag。这是自动更新唯一会「死循环」的情形，CI 的闸门就是为了拦它 |
 | `csc.exe not found` | runner 镜像换了。workflow 用的是 `windows-2022`，如改成别的镜像需确认自带 .NET Framework 4.x |
 | `WebView2Loader.dll not found inside the SDK package` | NuGet 包结构调整了，按 Actions 日志里打印的包内文件清单改 `Fetch the WebView2 SDK` 那一步的路径 |

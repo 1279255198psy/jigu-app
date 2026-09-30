@@ -389,17 +389,21 @@ docs\更新服务托管说明.md   开发者布署更新文件的完整说明
 **稽古: 发布新版本**（`Ctrl+Shift+P` → `Tasks: Run Task`），或者直接在终端：
 
 ```powershell
-powershell -NoProfile -File tools\release.ps1            # 用 build.ps1 里当前的版本号发布
-powershell -NoProfile -File tools\release.ps1 -Bump patch  # 忘了改版本号时：+1、提交、发布
+powershell -NoProfile -File tools\release.ps1            # 会先问版本号，再发布
+powershell -NoProfile -File tools\release.ps1 -Version 0.1.1  # 不问，直接指定
+powershell -NoProfile -File tools\release.ps1 -Bump patch  # 不问，自动 +1 修订号
 powershell -NoProfile -File tools\release.ps1 -DryRun      # 只检查，什么都不改
 ```
+
+**不用手工改版本号**：定了号之后，脚本自己把 `build.ps1` 和 `CHANGELOG.md` 的标题改好
+并一起提交（CI 构建的是 commit，留在工作区里的改动不会进包）。
 
 脚本自己判断该不该发（分支、未提交改动、版本号、远端是否已有这个 tag），
 推 tag 之后由 CI 构建并发布。完整说明见 `RELEASE.md`，脚本的取舍见它开头的注释。
 
 | 命令 | 作用 |
 | --- | --- |
-| `tools\release.ps1` | **发布**：校验 → 推 `main` → 打并推 tag `v<版本号>` → CI 自动构建发布 |
+| `tools\release.ps1` | **发布**：问版本号 → 改 `build.ps1` 与 `CHANGELOG` 标题并提交 → 推 `main` → 打并推 tag `v<版本号>` → CI 自动构建发布 |
 | `稽古.exe --selfcheck 报告.txt` | 界面资源 / 语料与同义词表 / **召回回归**（读内嵌的 `tests/cases.json`）/ 更新清单。**失败时退出码非 0** |
 | `稽古.exe --test-update <地址>` | 走完检查→下载→校验→解压替换全流程（不弹窗） |
 | `稽古.exe --built-in [url]` | 直接开内置 WinForms 界面（不碰 WebView2），用于诊断 |
