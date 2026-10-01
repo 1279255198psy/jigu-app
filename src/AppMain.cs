@@ -320,8 +320,11 @@ namespace Jigu
                 if (corpus.DocCount < 50) { fails++; sb.AppendLine("  FAIL 语料过少"); }
                 // 词表规模断言改成区间：原来的 "< 500" 在 24,356 词下几乎不可能触发，
                 // 等于没写。区间能把 EmitBlock / 词表过滤这类结构性改动抓出来。
-                // 当前实测 24,356；补全滑窗后预计升到约 44,000，故上界留到 60,000。
-                if (corpus.TermCount < 10000 || corpus.TermCount > 60000)
+                // 24,356 -> 滑窗补全 45,416 -> 精选集补上 cause/process/significance/cast
+                // 等标注字段后 111,693。这些字段本来就该进索引（见 Corpus.IndexDoc 的注释），
+                // 涨到 11 万是内容变厚的结果，不是结构出问题。上界放到 160,000 留出余量，
+                // 真有 EmitBlock 之类的改动会成倍地越过去，而不是擦边。
+                if (corpus.TermCount < 10000 || corpus.TermCount > 160000)
                 {
                     fails++;
                     sb.AppendLine("  FAIL 索引词数 " + corpus.TermCount + " 超出预期区间 [10000, 60000]");

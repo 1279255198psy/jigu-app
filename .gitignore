@@ -7,6 +7,14 @@ src/Version.g.cs
 # 0.4.0 及更早把安装负载写成这个生成文件（base64 字面量）；现在负载走 /resource:，
 # build.ps1 会把它删掉。留着这一条只为防旧工作区把它提交上去。
 src/InstallerPayload.g.cs
+
+# build\corpus\ 下的分片是**数据**，要进版本库（CI 靠它构建）。
+# 但 corpus.shards.zip 只是那些分片的压缩副本：build.ps1 每次构建都用
+# ZipFile.CreateFromDirectory 从 build\corpus 现造一份，只在本次构建内被 /resource:
+# 消费掉 —— 仓库里没有任何东西读它。留着它的代价是每更新一部书就要重写这 45 MB，
+# 而标注是打算一部一部做的，25 部就是 1 GB 永久压在 git 历史里。
+build/corpus.shards.zip
+
 # 图标生成过程的中间渲染（tools\make-icon.ps1 的输出）。
 # 真正的资源是 resources\app.ico 与 resources\app.png，那两个要进版本库。
 tools/icon-tmp/
@@ -33,6 +41,13 @@ tests/*-report.txt
 # tests\ 下那几份 WebView2 DLL 是从 SDK 目录复制来的二进制，用于编译探针程序
 tests/Microsoft.Web.WebView2.*.dll
 tests/WebView2Loader.dll
+
+# 稽古.exe --selfcheck 的输出，落在运行时的当前目录（默认就叫 jigu-selfcheck.txt，
+# 见 src\AppMain.cs）。理由与上面的 tests\*-report.txt 完全相同：跑一次重写一次，
+# 跟踪它等于每跑一次自检工作区就脏一次，而 tools\release.ps1 会因此拒绝发布。
+# 这一条原来是以「v0.4.0 的黄金快照」身份提交进来的，现已从索引里摘掉（文件仍在磁盘上）。
+# 真要留基线，用 --selfcheck <路径> 明确写到一个不进版本库的地方。
+jigu-selfcheck.txt
 
 # 运行期日志
 *.log

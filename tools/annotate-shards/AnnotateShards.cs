@@ -1,5 +1,10 @@
 // FILE: jigu-app/tools/annotate-shards/AnnotateShards.cs
-// 把史书分片送去做**构建期标注**，产出 cast/cause/process/significance/themes 五个字段。
+// 把史书分片送去做**构建期标注**，产出 cast/cause/process/decision/outcome/significance/themes
+// 七个正文字段，外加 verdict/verdictWhy 两个分级字段。
+//
+// verdict（上/中/下）是 Corpus.SearchByVerdict 分「上中下三策」的键：没有它，界面只能按
+// 相关度排，三策栏永远是空的。取值只认「上」「中」「下」，归一化走 Corpus.NormalizeVerdict ——
+// 这里调它，而不是自己再抄一份白名单，两处各写一套迟早会漂移成两个不同的闭集。
 //
 // 为什么是构建期而不是运行时：程序本身不联网、不带 AI，检索是本机倒排索引。
 // 标注是一次性的离线加工，产物冻结进分片 —— 用户机器上不开销、不依赖网络。
@@ -49,8 +54,9 @@ internal static class AnnotateShards
     private const double TokensPerCjkChar = 0.6;
     private const double TokensPerAsciiChar = 0.3;
 
-    /// <summary>输出长度上限。超出会被服务端截断，导致 JSON 解析失败而不是拿到半条。</summary>
-    private const int MaxOutputTokens = 900;
+    /// <summary>输出长度上限。超出会被服务端截断，导致 JSON 解析失败而不是拿到半条。
+    /// 加了 verdict/verdictWhy 之后每条多约 40 字输出，900 的余量变薄，提到 1000。</summary>
+    private const int MaxOutputTokens = 1000;
 
     /// <summary>单条史料的正文上限（字符）。史记 p99 是 872，正常不会触发；
     /// 这条是给「转换器切不动」留下的超长条目兜底，宁可截断也不要一个请求打爆上下文。</summary>
@@ -65,6 +71,15 @@ internal static class AnnotateShards
         public int Index;
         public string Original = "";
         public string Translation = "";
+        /// <summary>条目自带的人工整理字段。只有 --context 会用它们，——
+        /// 精选集的【原文】往往只是被引用的那一句（「水能载舟，亦能覆舟」），案情在
+        /// decision/outcome 里；不送过去，模型看到的是一句格言，只能给空档。</summary>
+        public string Decision = "";
+        public string Outcome = "";
+        /// <summary>条目手写的登场人物。--context 下拿它当 cast 的锚 —— 精选的原文只是
+        /// 一句引语，照分片那样从原文抽人，会把引语里没出现的人整批漏掉（实测：陈平反间
+        /// 手写四人，抽出来只剩项羽范增，行反间的陈平与受益的刘邦都没了）。</summary>
+        public string[] Figures = new string[0];
         /// <summary>回填写主键：书名 + 章节 + 条目序号。同书同章同序号的条目唯一。</summary>
         public string Key { get { return Book + "\u0001" + Chapter + "\u0001" + Index.ToString(CultureInfo.InvariantCulture); } }
     }
@@ -76,6 +91,10 @@ internal static class AnnotateShards
         public string[] Cast = new string[0];
         public string Cause = "", Process = "", Decision = "", Outcome = "", Significance = "";
         public string[] Themes = new string[0];
+        /// <summary>分级：上/中/下，空串表示「没分档」。已经过 Corpus.NormalizeVerdict 归一，
+        /// 落进 jsonl 的就一定是这三个字面之一，不会带着「上策」这种漂移写法往下走。</summary>
+        public string Verdict = "";
+        public string VerdictWhy = "";
         public string Error = "";
     }
 
@@ -89,7 +108,16 @@ internal static class AnnotateShards
     private static bool _thinking;
     private static int _concurrency = 8;
     private static int _limit = 0;
+    private static int _perChapter = 0;
     private static bool _resume, _estimate, _apply;
+    /// <summary>回填时只增补**缺失**的键，已存在的一律不动。分片用不上（那些字段全是
+    /// 标注自己写的，重跑就该覆盖）；精选集用得上 —— 它的 decision/outcome/themes/pros/cons
+    /// 是手写的，默认的「同名键以本次标注为准」会把它们换成模型的输出，那是拿 AI 覆盖
+    /// 人工，净变差。</summary>
+    private static bool _additive;
+    /// <summary>把条目自带的 decision/outcome 一并送去当案情。精选集的【原文】是被引用的
+    /// 一句话，案情在它自己的 decision/outcome 里；不给这段，模型对着格言判档位，只能给空。</summary>
+    private static bool _context;
     private static List<string> _only = new List<string>();
 
     private static int Main(string[] args)
@@ -123,11 +151,18 @@ internal static class AnnotateShards
         Console.WriteLine("=== 稽古 · 分片标注 ===");
         Console.WriteLine("分片目录 : " + shardDir);
         Console.WriteLine("条目     : " + items.Count + " 条（" + _only.Count + " 部书筛选后）");
+        if (_perChapter > 0) Console.WriteLine("抽样     : 每章至多 " + _perChapter + " 条（分层，每一章都有）");
         Console.WriteLine("共享前缀 : " + prefix.Length + " 字 ≈ " + prefixTokens + " tokens（命中前缀缓存）");
 
         // 正文长度分布：报价按均值算，但均值会被长尾带偏，所以分位一起给出。
+        // --context 下把案情那两段也算进去 —— 它们确实要花 token，不算就是报低。
         List<int> lens = new List<int>();
-        foreach (Item it in items) lens.Add(it.Original.Length + it.Translation.Length);
+        foreach (Item it in items)
+        {
+            int len = it.Original.Length + it.Translation.Length;
+            if (_context) len += it.Decision.Length + it.Outcome.Length;
+            lens.Add(len);
+        }
         lens.Sort();
         double bodyAvg = 0; foreach (int l in lens) bodyAvg += l; bodyAvg /= lens.Count;
         Console.WriteLine("正文字数 : 均 " + bodyAvg.ToString("F0") + " / 中位 " + lens[lens.Count / 2]
@@ -152,10 +187,18 @@ internal static class AnnotateShards
         Console.WriteLine("用法: AnnotateShards.exe <分片目录> <标注输出目录> [选项]");
         Console.WriteLine("  --only 史记,汉书   只处理这几部（按分片内的书名匹配）");
         Console.WriteLine("  --limit N          每部最多处理 N 条（先小样本验收用）");
+        Console.WriteLine("  --per-chapter N    每章最多取 N 条。按章分层，用来验收质量：");
+        Console.WriteLine("                     --limit 是取分片开头那一段，而那一段往往集中在某一两章上");
+        Console.WriteLine("                     （史记前 100 条有 93 条是太史公自序），判不出全书的成色。");
         Console.WriteLine("  --concurrency N    并发数，默认 8");
         Console.WriteLine("  --resume           跳过已有结果，可断可续");
         Console.WriteLine("  --estimate         只算 token 与费用，不发请求");
         Console.WriteLine("  --apply            把标注结果回填进分片（写到 <分片目录>.annotated）");
+        Console.WriteLine("  --additive         回填时只补缺失的键，已有的不动。给精选集用：它的");
+        Console.WriteLine("                     decision/outcome/themes/pros/cons 是手写的，不加这个开关");
+        Console.WriteLine("                     会被模型输出覆盖掉");
+        Console.WriteLine("  --context          把条目自带的 decision/outcome 当案情一并送去。给精选集用：");
+        Console.WriteLine("                     它的【原文】常只是一句引语，不给案情判不出档位");
         Console.WriteLine("  --model NAME       默认 deepseek-chat");
         Console.WriteLine("  --endpoint URL     默认 api.deepseek.com");
         Console.WriteLine("  --price-in / --price-out / --cache-discount   报价用单价（元/百万 token）");
@@ -177,11 +220,14 @@ internal static class AnnotateShards
                     }
                     i++; break;
                 case "--limit": _limit = Int(v, 0); i++; break;
+                case "--per-chapter": _perChapter = Int(v, 0); i++; break;
                 case "--concurrency": _concurrency = Math.Max(1, Int(v, 8)); i++; break;
                 case "--resume": _resume = true; break;
                 case "--thinking": _thinking = true; break;
                 case "--estimate": _estimate = true; break;
                 case "--apply": _apply = true; break;
+                case "--additive": _additive = true; break;
+                case "--context": _context = true; break;
                 case "--model": if (v.Length > 0) { _model = v; i++; } break;
                 case "--endpoint": if (v.Length > 0) { _endpoint = v; i++; } break;
                 case "--api-key": if (v.Length > 0) { _apiKey = v; i++; } break;
@@ -241,9 +287,43 @@ internal static class AnnotateShards
                 it.Index = n;
                 it.Original = Truncate(doc.Original, MaxBodyChars);
                 it.Translation = Truncate(doc.Translation, MaxBodyChars);
+                it.Decision = doc.Decision;
+                it.Outcome = doc.Outcome;
+                it.Figures = doc.Figures;
                 fileItems.Add(it);
                 n++;
             });
+            // 按章分层取样，排在 --limit 前面：--per-chapter 是每层的配额（「每章都要有」），
+            // --limit 是总量上限。
+            //
+            // 分层键必须用 title（就是章名，史记 130 个），不能用 chapter —— chapter 带着
+            // 「· 段 N」后缀，按它分组会变成每段一层，等于没分层。title 缺失时退回 chapter
+            // 的分隔符前段。
+            if (_perChapter > 0)
+            {
+                Dictionary<string, List<Item>> groups = new Dictionary<string, List<Item>>(StringComparer.Ordinal);
+                List<string> order = new List<string>();
+                foreach (Item it in fileItems)
+                {
+                    string key = StratumKey(it);
+                    List<Item> g;
+                    if (!groups.TryGetValue(key, out g)) { g = new List<Item>(); groups[key] = g; order.Add(key); }
+                    g.Add(it);
+                }
+                List<Item> keep = new List<Item>();
+                foreach (string key in order)
+                {
+                    List<Item> g = groups[key];
+                    if (g.Count <= _perChapter) { keep.AddRange(g); continue; }
+                    // 章内等距取中点，**不是取开头 N 条**。取开头会系统性地选中篇首，
+                    // 而篇首几乎必然是「某某者，某某人也」的生平简介或世系，那里没有人
+                    // 面对困境 —— 拿它验收，判出来一大片空档，看着像模型判不准，其实是
+                    // 取样选错了地方。中点至少不偏向任何一端。
+                    for (int k = 0; k < _perChapter; k++)
+                        keep.Add(g[(int)(((2L * k + 1) * g.Count) / (2L * _perChapter))]);
+                }
+                fileItems = keep;
+            }
             if (_limit > 0 && fileItems.Count > _limit) fileItems.RemoveRange(_limit, fileItems.Count - _limit);
             items.AddRange(fileItems);
         }
@@ -254,6 +334,19 @@ internal static class AnnotateShards
     {
         if (string.IsNullOrEmpty(s)) return "";
         return s.Length <= max ? s : s.Substring(0, max) + "…（原文过长，已截断）";
+    }
+
+    /// <summary>
+    /// 分层键 = 章名。用 title（史记里就是「淮阴侯列传」这样的章名，130 个），不能用
+    /// chapter —— 它带着「· 段 N」后缀（「伯夷列传 · 段 2.1」），按它分组会变成每段一层，
+    /// 等于没分层。title 缺失时退回 chapter 的分隔符前段。
+    /// </summary>
+    private static string StratumKey(Item it)
+    {
+        if (!string.IsNullOrEmpty(it.Title)) return it.Title;
+        string c = it.Chapter;
+        int sep = c.IndexOf(" · ", StringComparison.Ordinal);
+        return sep > 0 ? c.Substring(0, sep) : c;
     }
 
     // ------------------------------------------------------------------ 提示词
@@ -281,6 +374,16 @@ internal static class AnnotateShards
         sb.AppendLine("outcome     字符串。直接结局，一句话，说清这件事最后怎么样了。");
         sb.AppendLine("significance 字符串。一到两句，说清这件事对今天的现实困境有什么指导意义。");
         sb.AppendLine("            要具体到「遇到什么情况该怎么做」，不要写「以史为鉴」「值得深思」这类空话。");
+        sb.AppendLine("verdict     字符串，只能取「上」「中」「下」三者之一，一个字都不能改。");
+        sb.AppendLine("            判的是**当事人对那次困境的处置好不好**，不是这件事在历史上重不重要，");
+        sb.AppendLine("            也不是当事人的为人好坏。只看两条标尺：目的是否达成、代价是否可控。");
+        sb.AppendLine("              上 —— 目的达成，代价可控，局面能延续下去");
+        sb.AppendLine("              中 —— 目的只达成一部分；或虽达成，代价明显偏大、留下了隐患");
+        sb.AppendLine("              下 —— 目的落空；或代价远大于收益、局面比之前更糟");
+        sb.AppendLine("            实在判不出来就给空字符串，不要勉强三选一。");
+        sb.AppendLine("verdictWhy  字符串。一句话说清判成这一档的依据，要能对上 outcome。");
+        sb.AppendLine("            形如「以一次可控的退让换到主动，目的达成而代价有限」。");
+        sb.AppendLine("            没给 verdict 时给空字符串。");
         sb.AppendLine("themes      字符串数组，0~3 个。只能从下面的闭集里选，一个字都不能改，不得自创。");
         sb.AppendLine();
         sb.AppendLine("主题词闭集（74 个）：");
@@ -306,6 +409,10 @@ internal static class AnnotateShards
         sb.AppendLine("- 拿不准的字段给空字符串或空数组，不要编造。");
         sb.AppendLine("- cast 里没有确切人物时给空数组。");
         sb.AppendLine("- themes 里没有贴切的标签时给空数组，不要硬凑。");
+        sb.AppendLine("- verdict 判的是处置得好不好：天大的事被处置得一塌糊涂，依然是「下」。");
+        sb.AppendLine("- verdict 只在文中确有「当事人面对困境、作出取舍」时才给。作者本人的议论与");
+        sb.AppendLine("  评断，以及「作某本纪第几」这类篇目提要，一律给空字符串 —— 那里没有人在做取舍，");
+        sb.AppendLine("  硬判出来的档位是错的，不是缺的。");
         sb.AppendLine();
         sb.AppendLine("示例一");
         sb.AppendLine("原文：项王乃疑范增与汉有私，稍夺其权。范增大怒……疽发背而死。");
@@ -317,6 +424,9 @@ internal static class AnnotateShards
             + "\"significance\":\"团队处于关键期时，最忌讳先动元老。若对老臣有疑虑，"
             + "应当面把疑虑摆到桌上谈清楚，而不是靠削权、冷处理逼人自己走 —— 那既留不住人，"
             + "也让还在的人看清了自己的下场。\","
+            + "\"verdict\":\"下\","
+            + "\"verdictWhy\":\"在胜负未分之际先削掉唯一的战略谋主，此后军中再无战略层面的谋划，"
+            + "是自己把局面推得更糟。\","
             + "\"themes\":[\"内部矛盾\",\"猜忌\",\"亲信\"]}");
         sb.AppendLine();
         sb.AppendLine("示例二");
@@ -332,7 +442,24 @@ internal static class AnnotateShards
             + "\"significance\":\"推动得罪人的改革时，别把安全感全押在某一位上级的支持上。"
             + "要提前把制度本身立住、把受益方变成同盟，让改革在推动者离开后仍能自我运转 —— "
             + "否则人一走，事就翻。\","
+            + "\"verdict\":\"中\","
+            + "\"verdictWhy\":\"变法的目的达成了，秦国终成强国；但把全部安全感押在国君一人身上，"
+            + "代价是自身被车裂 —— 事成了，代价没控住。\","
             + "\"themes\":[\"改革受阻\",\"集权\",\"功高震主\"]}");
+        sb.AppendLine();
+        sb.AppendLine("示例三");
+        sb.AppendLine("原文：晋楚战于城濮，晋师退避三舍。楚众欲止，子玉不可。……楚师败绩。");
+        sb.AppendLine("输出：{\"cast\":[\"晋文公（晋国国君·主帅）\",\"子玉（楚军统帅）\"],"
+            + "\"cause\":\"晋文公流亡楚国时曾许诺「退避三舍」，如今两军对垒，这句旧诺成了绕不开的约束。\","
+            + "\"process\":\"晋军主动后撤九十里，既把当年的话兑现了，也把楚军引到了自己预设的战场上。\","
+            + "\"decision\":\"在敌强我弱时主动退让，把「守信」和「争主动」合成一步走，而不是硬碰硬。\","
+            + "\"outcome\":\"楚军追来，在城濮大败；晋文公由此奠定霸主地位。\","
+            + "\"significance\":\"对手找上门时，退一步未必是示弱 —— 如果这一步同时兑现了你的承诺、"
+            + "又把战场挪到对你有利的地方，那退就是主动。要怕的是两种：为了面子硬顶，"
+            + "或者退完了没有下一步。\","
+            + "\"verdict\":\"上\","
+            + "\"verdictWhy\":\"以一次可控的退让换到了道义与战场上的双重主动，目的达成而代价有限。\","
+            + "\"themes\":[\"示弱\",\"避实击虚\",\"敌强我弱\"]}");
         return sb.ToString();
     }
 
@@ -345,6 +472,26 @@ internal static class AnnotateShards
         sb.Append("【原文】").AppendLine(it.Original);
         if (!string.IsNullOrEmpty(it.Translation)) sb.Append("【白话】").AppendLine(it.Translation);
         else sb.AppendLine("【白话】（本条暂无译文，请只依据原文标注）");
+        if (_context && (it.Decision.Length > 0 || it.Outcome.Length > 0))
+        {
+            // 这两段是人工整理的，不是模型输出 —— 说白了「当事人做了什么、后来怎样」。
+            // 精选集里【原文】常只是一句引语（「水能载舟，亦能覆舟」），光看它无从判档位；
+            // 案情在这一段里。标注结果不写回这两个字段（回填时 --additive 也会挡住）。
+            sb.AppendLine("【以下是本条的案情整理，供判断档位用，不要照抄】");
+            if (it.Decision.Length > 0) sb.Append("【当事人的处置】").AppendLine(it.Decision);
+            if (it.Outcome.Length > 0) sb.Append("【后来的结果】").AppendLine(it.Outcome);
+            if (it.Figures.Length > 0)
+            {
+                // cast 以这张名单为准，**不是**从上面那段原文里挑。原文往往只是一句引语，
+                // 按它抽人会把引语外的人整批漏掉（陈平反间丢了陈平与刘邦）。身份角色照旧由
+                // 你补 —— 名单负责「有谁」，你负责「是谁」。
+                sb.Append("【本条已知人物】").AppendLine(string.Join("、", it.Figures));
+                sb.AppendLine("cast 必须覆盖【本条已知人物】里的每一位，一位都不能少，格式仍是");
+                sb.AppendLine("「姓名（身份·角色）」。其中有些人没有在上面那段原文里出现，那不要紧——");
+                sb.AppendLine("结合案情与常识补出他的身份角色即可，不要因为「原文没提」就把他删掉。");
+                sb.AppendLine("名单里若有显然不是人物的（地名、国名、书名之类），跳过不写。");
+            }
+        }
         return sb.ToString();
     }
 
@@ -361,12 +508,19 @@ internal static class AnnotateShards
     private static void PrintEstimate(List<Item> items, int prefixTokens, double bodyAvg)
     {
         double bodyTokens = 0;
-        foreach (Item it in items) bodyTokens += EstimateTokens(it.Original) + EstimateTokens(it.Translation);
+        foreach (Item it in items)
+        {
+            bodyTokens += EstimateTokens(it.Original) + EstimateTokens(it.Translation);
+            if (_context) bodyTokens += EstimateTokens(it.Decision) + EstimateTokens(it.Outcome)
+                + EstimateTokens(string.Join("、", it.Figures));
+        }
         double avgBody = bodyTokens / items.Count;
 
         double inFresh = items.Count * avgBody;                       // 只有正文是新的
         double inCached = items.Count * prefixTokens;                 // 前缀每请求重复一次，但按缓存价
-        double outTokens = items.Count * 250.0;                       // 输出按 250 token/条估
+        // 输出按 300 token/条估。原来是 250，加了 verdict 的一句话判词之后每条多约 40 字，
+        // 这个数只影响报价提示，宁可报高不报低。
+        double outTokens = items.Count * 300.0;
 
         double inCost = (inFresh + inCached * _cacheDiscount) / 1e6 * _priceIn;
         double outCost = outTokens / 1e6 * _priceOut;
@@ -378,7 +532,7 @@ internal static class AnnotateShards
             + " = " + (prefixTokens + avgBody).ToString("F0") + " tokens");
         Console.WriteLine("输入合计   : " + ((inFresh + inCached) / 1e6).ToString("F2") + " M（其中 "
             + (inCached / 1e6).ToString("F2") + " M 走缓存）");
-        Console.WriteLine("输出合计   : " + (outTokens / 1e6).ToString("F2") + " M（按每条 250 token 估）");
+        Console.WriteLine("输出合计   : " + (outTokens / 1e6).ToString("F2") + " M（按每条 300 token 估）");
         Console.WriteLine("思考模式   : " + (_thinking ? "开（思维链按输出计费，费用会明显高于下表）" : "关"));
         Console.WriteLine();
         Console.WriteLine("高峰时段   : ¥" + total.ToString("F2") + "   （" + items.Count + " 条，约 ¥"
@@ -407,16 +561,26 @@ internal static class AnnotateShards
         }
 
         int done = 0, failed = 0, skipped = 0;
+        // 进度按**本文件**报，不按全局。done 是跨文件累加的，拿它当分子、拿 todo.Count
+        // 当分母，第二个文件起就会打出「已标注 50/43」这种分子大于分母的行 —— 看着像计数
+        // 坏了，其实只是两个不同口径的数被放在了一起。
+        int fileDone = 0;
         foreach (KeyValuePair<string, List<Item>> kv in bySlug)
         {
             string jsonlPath = Path.Combine(outDir, kv.Key + ".jsonl");
             HashSet<string> have = new HashSet<string>(StringComparer.Ordinal);
+            int stale = 0;
             if (_resume && File.Exists(jsonlPath))
             {
                 foreach (string ln in File.ReadAllLines(jsonlPath, Encoding.UTF8))
                 {
                     Result r = ParseResultLine(ln);
-                    if (r != null) have.Add(r.Book + "\u0001" + r.Chapter + "\u0001"
+                    if (r == null) continue;
+                    // 加 verdict 之前写下的行没有这个键 —— 那是旧提示词的产物，档位是缺的。
+                    // 当成「已完成」跳过去，这批史料就永远分不了档，而界面只会表现为
+                    // 「这一档暂无贴切的史事」，看不出是漏标。所以只认带 verdict 键的行。
+                    if (ln.IndexOf("\"verdict\"", StringComparison.Ordinal) < 0) { stale++; continue; }
+                    have.Add(r.Book + "\u0001" + r.Chapter + "\u0001"
                         + r.Index.ToString(CultureInfo.InvariantCulture));
                 }
             }
@@ -430,8 +594,10 @@ internal static class AnnotateShards
                     todo.Add(it);
                 }
                 if (todo.Count == 0) { Console.WriteLine(kv.Key + ": 已全部标注，跳过"); continue; }
+                fileDone = 0;
 
-                Console.WriteLine(kv.Key + ": " + todo.Count + " 条待标注（并发 " + _concurrency + "）");
+                Console.WriteLine(kv.Key + ": " + todo.Count + " 条待标注（并发 " + _concurrency + "）"
+                    + (stale > 0 ? "，含 " + stale + " 条旧格式（无 verdict），本次重标" : ""));
                 int cursor = -1;
                 object gate = new object();
                 List<Thread> threads = new List<Thread>();
@@ -458,10 +624,12 @@ internal static class AnnotateShards
                                 else
                                 {
                                     done++;
+                                    fileDone++;
                                     w.WriteLine(ToLine(r));
                                     w.Flush();   // 立刻落盘：进程被杀也不丢已完成的
-                                    if (done % 25 == 0)
-                                        Console.WriteLine("  已标注 " + done + "/" + todo.Count);
+                                    if (fileDone % 25 == 0 || fileDone == todo.Count)
+                                        Console.WriteLine("  已标注 " + fileDone + "/" + todo.Count
+                                            + "（累计 " + done + "）");
                                 }
                             }
                         }
@@ -528,6 +696,11 @@ internal static class AnnotateShards
             r.Decision = Str(a, "decision");
             r.Outcome = Str(a, "outcome");
             r.Significance = Str(a, "significance");
+            // 归一在这里而不是回填时：jsonl 是中间产物但会被 --resume 和 --apply 反复读，
+            // 让「上策」这类漂移写法落进文件，日后就得在三个地方各拦一次。
+            r.Verdict = Corpus.NormalizeVerdict(Str(a, "verdict"));
+            r.VerdictWhy = Str(a, "verdictWhy");
+            if (r.Verdict.Length == 0) r.VerdictWhy = "";   // 没档位就不留悬空的判词
             return r;
         }
         catch (Exception ex)
@@ -687,6 +860,8 @@ internal static class AnnotateShards
         sb.Append(",\"decision\":\"").Append(Json.Escape(r.Decision)).Append('"');
         sb.Append(",\"outcome\":\"").Append(Json.Escape(r.Outcome)).Append('"');
         sb.Append(",\"significance\":\"").Append(Json.Escape(r.Significance)).Append('"');
+        sb.Append(",\"verdict\":\"").Append(Json.Escape(r.Verdict)).Append('"');
+        sb.Append(",\"verdictWhy\":\"").Append(Json.Escape(r.VerdictWhy)).Append('"');
         sb.Append(",\"themes\":").Append(Arr(r.Themes));
         sb.Append('}');
         return sb.ToString();
@@ -717,6 +892,9 @@ internal static class AnnotateShards
             r.Cause = Str(o, "cause"); r.Process = Str(o, "process");
             r.Decision = Str(o, "decision"); r.Outcome = Str(o, "outcome");
             r.Significance = Str(o, "significance");
+            r.Verdict = Corpus.NormalizeVerdict(Str(o, "verdict"));
+            r.VerdictWhy = Str(o, "verdictWhy");
+            if (r.Verdict.Length == 0) r.VerdictWhy = "";
             r.Themes = Clean(StrArray(o, "themes"));
             return r;
         }
@@ -798,6 +976,20 @@ internal static class AnnotateShards
         Console.WriteLine();
         Console.WriteLine("完成 : " + files + " 个分片，共回填 " + patched + " 条");
         Console.WriteLine("输出 : " + dest);
+        // 这一步没人替你做，而它一旦漏掉，症状是「标注跑了、程序里一条档位也没有」——
+        // build.ps1 只认 <分片目录>，不认 <分片目录>.annotated。写在这里，是最后一个
+        // 还能拦住的时点。
+        Console.WriteLine();
+        Console.WriteLine("注意 : build.ps1 打包的是 " + shardDir + "，不是上面这个目录。");
+        Console.WriteLine("       要让标注真正进程序，得把 " + dest + " 的内容换到 " + shardDir + " 去（先备份原件）。");
+        if (_additive)
+        {
+            // 精选集还有一道 build.ps1 的门：它把 resources\data\*.json 合并成 corpus.json 时
+            // 只抄了一份写死的字段清单（build.ps1 的 $rec），清单里没有 verdict 的话，
+            // 这里回填得再对，进了程序也是一条档位都不剩。
+            Console.WriteLine("       精选集另有一关：build.ps1 合并 corpus.json 时的字段清单（$rec）要");
+            Console.WriteLine("       一并加上 verdict/verdictWhy，否则会被合并这一步丢掉。");
+        }
         return 0;
     }
 
@@ -828,16 +1020,19 @@ internal static class AnnotateShards
         if (r.Decision.Length > 0) parts.Add(new string[] { "decision", "\"" + Json.Escape(r.Decision) + "\"" });
         if (r.Outcome.Length > 0) parts.Add(new string[] { "outcome", "\"" + Json.Escape(r.Outcome) + "\"" });
         if (r.Significance.Length > 0) parts.Add(new string[] { "significance", "\"" + Json.Escape(r.Significance) + "\"" });
+        if (r.Verdict.Length > 0) parts.Add(new string[] { "verdict", "\"" + Json.Escape(r.Verdict) + "\"" });
+        if (r.VerdictWhy.Length > 0) parts.Add(new string[] { "verdictWhy", "\"" + Json.Escape(r.VerdictWhy) + "\"" });
         if (r.Themes.Length > 0) parts.Add(new string[] { "themes", Arr(r.Themes) });
 
         // 先在 head 上就地替换已存在的键（同一份结果回填两次不会长出重复键，
         // 也不会留下上一次的旧值），再把剩下的补到末尾。
+        // --additive 下已有键取了不改 —— 那条分支是给精选集用的，见 _additive 的注释。
         string replaced;
         List<string[]> missing = new List<string[]>();
         foreach (string[] p in parts)
         {
             if (!TryReplace(head, p[0], p[1], out replaced)) missing.Add(p);
-            else head = replaced;
+            else if (!_additive) head = replaced;
         }
 
         sb = new StringBuilder(head.Length + 512);

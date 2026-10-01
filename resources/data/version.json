@@ -1,16 +1,16 @@
 {
     "version":  "1.2.0",
-    "generated_at":  "2026-09-24T05:31:15Z",
+    "generated_at":  "2026-10-01T17:47:11Z",
     "source_url":  "https://github.com/alephpi/24histories-simplified-chinese",
     "schema_version":  "1",
     "books":  {
-                  "00_种子":  "98c12eec10340ad69bd0488fe2c774c7da8071694a3a9b0a31bd07b84cdb7d76",
-                  "01_先秦秦汉":  "71059ae24293fac49745a2da2596c9b0575e335d2716b8f4f89f855857a5af2c",
-                  "02_三国两晋":  "5a623a9938bf845419bdc78754c3745681c6eaf19093babd27daf9cddc4a5718",
-                  "03_隋唐五代":  "32dbba3135b7cfa8e27d4d3749bdb58dc1b6991d0c751a7d8794b673e865dce8",
-                  "04_两宋":  "80ab32c34a3078f2e276a49e600839bbf98445a9580f2beeb774363ba227042b",
-                  "05_明":  "5035615e30ef065e9179f0064ccb8ee61cb01bef57397b892fba4817f00a0d8e",
-                  "06_清":  "651d49d10ac20008f4cce37dd3f9aa17db5940a6e3f6c1848205007a48925df2"
+                  "00_种子":  "4f4be63093bc665f3aef740dde7d3ce9ae73ca230ba82d64b17e5d8eb148d543",
+                  "01_先秦秦汉":  "e94c607394f4b54b7248f59eeab2a3238f1b455b664ffa3e370b74e3f26f9f03",
+                  "02_三国两晋":  "0eb3a81e78c5b1a35917b7d12d5e9f3a2a7c2897252e708a2abcee54afa2cc70",
+                  "03_隋唐五代":  "6251c3ad788038053e824c9005c463bb6d2ba49760e9449eb893149a027789ed",
+                  "04_两宋":  "528e65786881053876b22c43ed1a2e51e68849085b144dede3c2693bc4eba874",
+                  "05_明":  "60a56ad6f79eb8798067d830c9bef646fe6af625bc17aa300632b6bf63570f93",
+                  "06_清":  "964ef1d9ed8dde6bc441a1f3b8ddfb64bd51e9c42eab69c736f5fef9d92f8f03"
               },
     "paths":  {
                   "00_种子":  "00_种子.json",

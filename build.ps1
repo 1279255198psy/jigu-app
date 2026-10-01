@@ -302,6 +302,15 @@ foreach ($file in $dataFiles) {
       figures = $it.figures; decision = $it.decision; outcome = $it.outcome; themes = $it.themes
       pros = $it.pros; cons = $it.cons
     }
+    # The annotation fields are copied through only when the record actually carries them.
+    # Assigning them unconditionally would emit "verdict": null for every unannotated
+    # record, and a null where the reader expects a string is a different thing from a
+    # missing key -- the shards ship the two forms side by side, so corpus.json must too.
+    if ($it.cast)         { $rec["cast"] = $it.cast }
+    if ($it.cause)        { $rec["cause"] = $it.cause }
+    if ($it.process)      { $rec["process"] = $it.process }
+    if ($it.significance) { $rec["significance"] = $it.significance }
+    if ($it.verdict)      { $rec["verdict"] = $it.verdict; $rec["verdictWhy"] = $it.verdictWhy }
     [void]$all.Add(@([string]$it.original, $rec))
     $count++; $rawDocs++
   }
