@@ -66,11 +66,17 @@ Get-ChildItem (Join-Path $root "resources\data") -Filter *.json | Sort-Object Na
       $cand = $SYN_TIERS[$n % 3]
       if ($cand -ne $SkipTier) { $v = $cand }
     }
+    # 这份清单要与 build.ps1 的 $rec 和 web\app.js 的渲染分支对齐：漏一个字段，
+    # 预览里对应的那一块就是空的，而人只会以为「排版没做」。cast/cause/process/
+    # significance 是标注期才补上的，这张表当时还没跟上，于是「核心人物」只剩人名
+    # 裸串（走 figures 回落）、「现实意义」整块不出现 —— 而三样在真机上都有。
     [void]$items.Add([ordered]@{
       book = $o.book; chapter = $it.chapter; title = $it.title
       original = $it.original; translation = $it.translation
       figures = $it.figures; decision = $it.decision; outcome = $it.outcome
       themes = $it.themes; pros = $it.pros; cons = $it.cons
+      cast = $it.cast; cause = $it.cause; process = $it.process
+      significance = $it.significance
       verdict = $v; verdictWhy = $(if ($v) { $SYN_WHY[$v] } else { "" })
     })
     $n++

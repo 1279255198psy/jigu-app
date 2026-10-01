@@ -280,15 +280,15 @@
     lead.appendChild(chips);
     return lead;
   }
-  // 决策分析栏：利/弊正文是随语料写好的（离线、不调用 AI），只有「与你的处境对应」
-  // 这一行是运行时算的 —— 看这条史料的哪些情境词原样出现在用户输入里。
-  function analysisBlock(hit, query) {
+  // 决策分析栏：利/弊正文是随语料写好的（离线、不调用 AI）。
+  // 这里**不再**渲染「与你的处境对应」那一行：它与上面 renderPlanCol 的「当时的处境」
+  // 取的是同一份 themes、同一套点亮判据，从前一个在概览、一个在展开里所以看不出来，
+  // 如今两块并排，同一排词会连着出现两遍。
+  function analysisBlock(hit) {
     var pros = hit.pros || [], cons = hit.cons || [];
     if (!pros.length && !cons.length) return null;
     var wrap = el("section", "block analysis");
     wrap.appendChild(el("h4", null, "决策分析"));
-    var line = situationLine(hit.themes, query, query ? "与你的处境对应：" : "本条情境：");
-    if (line) wrap.appendChild(line);
     var grid = el("div", "grid-2");
     var pu = el("ul", "pros");
     if (pros.length) for (var p = 0; p < pros.length; p++) pu.appendChild(el("li", null, pros[p]));
@@ -300,7 +300,7 @@
     grid.appendChild(block("这么做要付的代价", cu));
     wrap.appendChild(grid);
     wrap.appendChild(el("p", "analysis-note",
-      "这两栏是史事本身的条件与代价，不是结论。哪一边更重，取决于你的实际情况与上面那几个词是否成立。"));
+      "这两栏是史事本身的条件与代价，不是结论。哪一边更重，取决于你的实际情况与上面「当时的处境」里那几个词是否成立。"));
     return wrap;
   }
   // 关键决策正文：decision 是一句话概括，cause / process 是标注补上的起因与经过。
@@ -362,28 +362,14 @@
     if (s.length <= n) return s;
     return s.substr(0, n) + "…";
   }
-  // 展开后的全文。概览栏已经显示过「怎么做」「结果如何」，这里不重复，
-  // 只补原文、译文、人物、现实意义、利弊 —— 两处都调 block()，排版不会漂移。
-  function renderHitDetail(hit, query) {
+  // 展开后的正文：只有原文与白话译文。
+  // 其余判断依据（核心人物、现实意义、决策分析、命中词元）一律摆在展开**之外**，
+  // 与「怎么做」「结果如何」并列直接可见 —— 它们是读一条史料时真正要看的，
+  // 藏在一次点击后面等于没写。展开留给「原文长什么样」这一个问题。
+  function renderSourceText(hit) {
     var wrap = el("div", "hit-detail");
     wrap.appendChild(block("原文摘录", el("blockquote", "quote", hit.original || "（未收录原文）")));
     wrap.appendChild(block("现代文翻译", el("p", "prose", hit.translation || "（该条暂无白话译文）")));
-    // 核心人物：cast 带身份角色（「项羽（西楚霸王·主帅）」），201 条精选只有 figures
-    // 且是人名裸串。cast 非空就用 cast，否则回落 figures —— 精选那边完全不受影响。
-    var cast = (hit.cast && hit.cast.length) ? hit.cast : hit.figures;
-    var figs = el("ul", "figures" + (hit.cast && hit.cast.length ? " cast" : ""));
-    if (cast && cast.length) {
-      for (var i = 0; i < cast.length; i++) figs.appendChild(el("li", null, cast[i]));
-    } else figs.appendChild(el("li", "muted", "未标注"));
-    wrap.appendChild(block("核心人物", figs));
-    // 现实意义与「决策分析（利/弊）」并列但独立：前者是这条史料对当下的启发，
-    // 后者是史事本身的条件与代价。没有标注的条目整块不出现，不留空壳。
-    if (hit.significance) {
-      wrap.appendChild(block("现实意义", el("p", "prose significance", hit.significance)));
-    }
-    var an = analysisBlock(hit, query);
-    if (an) wrap.appendChild(an);
-    if (hit.terms && hit.terms.length) wrap.appendChild(block("命中词元", chipList(hit.terms)));
     wrap.appendChild(sealCorner());
     return wrap;
   }
@@ -445,21 +431,44 @@
     var hasHow = !!(hit.decision || hit.cause || hit.process);
     if (hasHow) col.appendChild(block("怎么做", decisionBody(hit)));
     if (hit.outcome) col.appendChild(block("结果如何", el("p", "prose outcome", hit.outcome)));
-    // 没有标注的分片条目（只有原文与译文）概览几乎无话可说，给一段译文节选，
-    // 免得整栏只剩一个标题。全文仍在「展开」里。
-    if (!hasHow && !hit.outcome && !(hit.themes && hit.themes.length) && hit.translation) {
+
+    // 以下四块原先在「展开」里，现改为直接呈现（见 renderSourceText 的注释）。
+    // 核心人物：cast 带身份角色（「项羽（西楚霸王·主帅）」），精选条目只有 figures
+    // 且是人名裸串。cast 非空就用 cast，否则回落 figures —— 精选那边完全不受影响。
+    var cast = (hit.cast && hit.cast.length) ? hit.cast : hit.figures;
+    if (cast && cast.length) {
+      var figs = el("ul", "figures" + (hit.cast && hit.cast.length ? " cast" : ""));
+      for (var i = 0; i < cast.length; i++) figs.appendChild(el("li", null, cast[i]));
+      col.appendChild(block("核心人物", figs));
+    }
+    // 现实意义与「决策分析（利/弊）」并列但独立：前者是这条史料对当下的启发，
+    // 后者是史事本身的条件与代价。没有标注的条目整块不出现，不留空壳。
+    if (hit.significance) {
+      col.appendChild(block("现实意义", el("p", "prose significance", hit.significance)));
+    }
+    var an = analysisBlock(hit);
+    if (an) col.appendChild(an);
+
+    // 没有标注的分片条目（只有原文与译文）上面那些块一个都不会出现，给一段译文节选，
+    // 免得整栏只剩一个标题。原文与译文全文仍在「展开」里。
+    var annotated = hasHow || hit.outcome || (hit.themes && hit.themes.length)
+      || hit.significance || (cast && cast.length)
+      || (hit.pros && hit.pros.length) || (hit.cons && hit.cons.length);
+    if (!annotated && hit.translation) {
       col.appendChild(block("白话译文（节选）", el("p", "prose", clip(hit.translation, 90))));
     }
     var why = whyBlock(hit.why);
     if (why) col.appendChild(why);
-    var btn = el("button", "plan-expand", "展开全文");
+    if (hit.terms && hit.terms.length) col.appendChild(block("命中词元", chipList(hit.terms)));
+
+    var btn = el("button", "plan-expand", "展开原文与译文");
     btn.type = "button";
     btn.setAttribute("aria-expanded", "false");
-    var detail = renderHitDetail(hit, query);
+    var detail = renderSourceText(hit);
     detail.hidden = true;
     btn.addEventListener("click", function () {
       detail.hidden = !detail.hidden;
-      btn.textContent = detail.hidden ? "展开全文" : "收起";
+      btn.textContent = detail.hidden ? "展开原文与译文" : "收起";
       btn.setAttribute("aria-expanded", detail.hidden ? "false" : "true");
     });
     col.appendChild(btn);
