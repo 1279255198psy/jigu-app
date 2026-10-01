@@ -8,6 +8,8 @@
 //
 // 与别的探针不同，本探针必须和安装向导的源码编译在一起（要直接读 InstallerPayload
 // 的真键表，并通过反射调用 UninstallForm 的私有静态方法）。编译命令见 README.md。
+// 键表现在来自 obj\payload.setup.zip 这个压缩资源（不再是生成的 .g.cs），所以编译时
+// 必须带上同一个 /resource:，否则 Table() 会是空表、本探针就在空夹具上「通过」。
 //
 // 注意命名空间：InstallerPayload 在 Jigu，而 UninstallForm / SetupInfo 在 JiguSetup
 // （安装向导与主程序共用 Host.cs、Update.cs 等，所以那些还在 Jigu）。
@@ -55,7 +57,7 @@ namespace Jigu
         {
             string dir = Path.Combine(_root, tag);
             Directory.CreateDirectory(dir);
-            foreach (KeyValuePair<string, string> kv in InstallerPayload.Table())
+            foreach (KeyValuePair<string, byte[]> kv in InstallerPayload.Table())
             {
                 string rel = kv.Key.Replace('/', Path.DirectorySeparatorChar);
                 string p = Path.Combine(dir, rel);
@@ -119,7 +121,17 @@ namespace Jigu
 
             Say("== 卸载判定回归 ==");
             Say("沙箱: " + _root);
-            Say("载荷文件数: " + InstallerPayload.Table().Count);
+            int payloadFiles = InstallerPayload.Table().Count;
+            Say("载荷文件数: " + payloadFiles);
+            // 空表意味着这次编译没带 /resource:（键表来自 obj\payload.setup.zip）。
+            // 那样下面的夹具全是空的，"我们的目录 / 不是我们的目录" 两条判定会在空目录上
+            // 双双成立 —— 一个安静通过的假绿灯，比红更糟。宁可在这里直接判失败。
+            if (payloadFiles == 0)
+            {
+                Say("");
+                Say("RESULT: FAILURES = 1（载荷键表为空 —— 编译时漏了 /resource:，见文件头）");
+                return 2;
+            }
             Say("");
 
             try

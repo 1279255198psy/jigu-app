@@ -1,5 +1,5 @@
 // FILE: jigu-app/src/PayloadExt.cs
-// 安装包负载的自解压实现（与 build.ps1 生成的 InstallerPayload 类配合）。
+// 安装包负载的自解压实现（负载由 build.ps1 作为 /resource: 装进装配，见 Table）。
 // 用途：
 //   1. 安装向导把全部文件释放到用户选择的安装目录；
 //   2. 热更新时新的安装包以 --extract-to <目录> 运行，覆盖旧文件。
@@ -15,6 +15,66 @@ namespace Jigu
     {
         /// <summary>史书分片资源的清单资源名（由 build.ps1 的 /resource: 装入）</summary>
         public const string ShardResourceName = "Jigu.corpus.shards.zip";
+
+        /// <summary>安装负载资源的清单资源名（同样是 build.ps1 的 /resource:）</summary>
+        public const string PayloadResourceName = "Jigu.payload.zip";
+
+        private static Dictionary<string, byte[]> _table;
+        private static readonly object _tableGate = new object();
+
+        /// <summary>
+        /// 负载清单：相对路径（正斜杠分隔）-> 文件内容。只解一次，之后走缓存。
+        ///
+        /// 0.4.0 之前这张表是 build.ps1 生成的一整份 base64 字面量。字面量在程序集里按
+        /// UTF-16 存放，base64 之后再翻一倍（实测 2.67×），而且要记在 csc 的**用户字符串堆**
+        /// 上 —— 那是个硬顶。0.4.0 的 CI 就是这样炸的：负载因新版 WebView2 SDK 长了 877 KB，
+        /// 与 45 MB 的分片资源同一次编译，csc 直接报「已无逻辑空间可创建更多用户字符串」
+        /// （CS0013）。同一份源码在装着旧 SDK 的机器上编得过、在 CI 上编不过 —— 典型的
+        /// 「差一个参数」形状，靠调负载大小是治不好的，只会越来越近。
+        ///
+        /// 所以与分片同走 /resource: 的 zip：不占字符串堆，按 deflate 后的体积算。
+        /// 资源缺席时（只编 src\*.cs 的编译检查、或没带负载的旧装配）返回空表而不是抛异常，
+        /// 与 ExtractShards 的做法一致。
+        /// </summary>
+        public static Dictionary<string, byte[]> Table()
+        {
+            lock (_tableGate)
+            {
+                if (_table != null) return _table;
+                Dictionary<string, byte[]> t = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    Stream res = typeof(InstallerPayload).Assembly
+                        .GetManifestResourceStream(PayloadResourceName);
+                    if (res == null)
+                    {
+                        Log.Write("Table: 装配里没有 " + PayloadResourceName + "，负载按空处理");
+                        return _table = t;
+                    }
+                    using (res)
+                    using (ZipArchive zip = new ZipArchive(res, ZipArchiveMode.Read))
+                    {
+                        foreach (ZipArchiveEntry e in zip.Entries)
+                        {
+                            string name = e.FullName.Replace('\\', '/');
+                            if (name.EndsWith("/", StringComparison.Ordinal)) continue;
+                            using (Stream src = e.Open())
+                            using (MemoryStream ms = new MemoryStream())
+                            {
+                                src.CopyTo(ms);
+                                t[name] = ms.ToArray();
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // 资源坏了也不该让安装向导直接崩：报空表，由调用方按「一个都没释放」处理
+                    Log.Error("Table 读取 " + PayloadResourceName, ex);
+                }
+                return _table = t;
+            }
+        }
 
         /// <summary>分片落地的目录名，与 Library.DirName 一致</summary>
         private const string ShardDirName = "corpus";
@@ -47,7 +107,7 @@ namespace Jigu
             failed = 0;
             if (string.IsNullOrEmpty(destDir)) return 0;
 
-            Dictionary<string, string> table = Table();
+            Dictionary<string, byte[]> table = Table();
             int n = 0;
             try
             {
@@ -61,7 +121,7 @@ namespace Jigu
                 return 0;
             }
 
-            foreach (KeyValuePair<string, string> kv in table)
+            foreach (KeyValuePair<string, byte[]> kv in table)
             {
                 try
                 {
@@ -78,7 +138,7 @@ namespace Jigu
                     string dir = Path.GetDirectoryName(path);
                     if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
 
-                    byte[] bytes = Convert.FromBase64String(kv.Value);
+                    byte[] bytes = kv.Value;
 
                     // 原子写入，避免覆盖过程中被占用导致半截文件
                     string tmp = path + ".tmp";

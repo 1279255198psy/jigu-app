@@ -4,10 +4,14 @@
 //   2. 从 exe 提取到的图标与源图标逐像素比对（相同则说明 exe 用的就是新图标）
 //   3. 安装包 exe 的图标同样比对
 // 用法: IconCheck.exe <项目根目录>
+// 编译: csc -main:IconCheck -out:tests\IconCheck.exe tests\IconCheck.cs -reference:System.Drawing.dll
+//       -reference:System.IO.Compression.dll -reference:System.IO.Compression.FileSystem.dll
+//       （ZipArchive 在前者、ZipFile 在后者，两个都要）
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.IO.Compression;
 using System.Text;
 
 internal static class IconCheck
@@ -81,16 +85,32 @@ internal static class IconCheck
             string iconName = Path.GetFileName(icons[0]);
             Ok("交付目录含版本化图标 " + iconName);
 
-            string payloadGen = Path.Combine(root, @"src\InstallerPayload.g.cs");
-            if (File.Exists(payloadGen))
+            // 负载自 0.4.0 起不再是一份生成的 .cs：base64 字面量会撑爆 csc 的用户字符串堆
+            // （见 build.ps1 的 New-PayloadZip）。现在它是一个 zip 资源，条目名就是相对
+            // 路径。这里改查那份 zip —— 断言的意图不变，问的还是「交付出去的安装包里
+            // 有没有这个图标」。
+            string payloadZip = Path.Combine(root, @"obj\payload.setup.zip");
+            if (!File.Exists(payloadZip))
             {
-                string text = File.ReadAllText(payloadGen, Encoding.UTF8);
-                if (text.IndexOf(iconName, StringComparison.Ordinal) >= 0)
-                    Ok("安装包负载内含 " + iconName + "（快捷方式与卸载项用它，避开图标缓存）");
-                else
-                    Fail("安装包负载缺少版本化图标 " + iconName);
+                Fail("缺少 " + payloadZip + "（先跑 build.ps1 生成安装负载）");
             }
-            else Fail("缺少 InstallerPayload.g.cs");
+            else
+            {
+                bool found = false;
+                using (ZipArchive zip = ZipFile.OpenRead(payloadZip))
+                {
+                    foreach (ZipArchiveEntry e in zip.Entries)
+                    {
+                        if (string.Equals(e.FullName, iconName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (found) Ok("安装包负载内含 " + iconName + "（快捷方式与卸载项用它，避开图标缓存）");
+                else Fail("安装包负载缺少版本化图标 " + iconName);
+            }
         }
 
         // ---------- 5. 是否退化成默认图标 ----------

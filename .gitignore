@@ -3,8 +3,10 @@ dist/
 obj/
 bin/
 src/EmbeddedAssets.g.cs
-src/InstallerPayload.g.cs
 src/Version.g.cs
+# 0.4.0 及更早把安装负载写成这个生成文件（base64 字面量）；现在负载走 /resource:，
+# build.ps1 会把它删掉。留着这一条只为防旧工作区把它提交上去。
+src/InstallerPayload.g.cs
 # 图标生成过程的中间渲染（tools\make-icon.ps1 的输出）。
 # 真正的资源是 resources\app.ico 与 resources\app.png，那两个要进版本库。
 tools/icon-tmp/

@@ -1,5 +1,5 @@
 // FILE: jigu-app/src/Installer.cs
-// 稽古 · Windows 安装向导（自包含：负载以 base64 编译进本安装包）
+// 稽古 · Windows 安装向导（自包含：负载以压缩 zip 资源编译进本安装包）
 //
 // 提供与常规安装程序等价的能力：
 //   · 中文安装向导（欢迎页 / 选择安装位置 / 创建桌面快捷方式 / 进度 / 完成）
@@ -9,7 +9,7 @@
 //   · 卸载向导（稽古-卸载.exe /uninstall）与静默安装（/silent）
 //   · 全程不联网、不需要管理员权限
 //
-// 编译：csc /target:winexe /out:稽古-安装包.exe HostIcon + Installer.cs + InstallerPayload.g.cs
+// 编译：见 build.ps1 第 6 步（负载与分片各是一个 /resource:，不再是生成的 .g.cs）
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -148,8 +148,8 @@ namespace JiguSetup
             get
             {
                 long n = 0;
-                foreach (KeyValuePair<string, string> kv in InstallerPayload.Table())
-                    n += (long)(kv.Value.Length * 3 / 4);
+                foreach (KeyValuePair<string, byte[]> kv in InstallerPayload.Table())
+                    n += (long)kv.Value.Length;
                 return n;
             }
         }
@@ -157,16 +157,16 @@ namespace JiguSetup
         /// <summary>释放全部文件；onFile 用于回报进度</summary>
         public static int Extract(string targetDir, Action<int, int, string> onFile)
         {
-            Dictionary<string, string> table = InstallerPayload.Table();
+            Dictionary<string, byte[]> table = InstallerPayload.Table();
             if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
             int done = 0, total = table.Count;
-            foreach (KeyValuePair<string, string> kv in table)
+            foreach (KeyValuePair<string, byte[]> kv in table)
             {
                 string rel = kv.Key.Replace('/', Path.DirectorySeparatorChar);
                 string path = Path.Combine(targetDir, rel);
                 string dir = Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                File.WriteAllBytes(path, Convert.FromBase64String(kv.Value));
+                File.WriteAllBytes(path, kv.Value);
                 done++;
                 if (onFile != null) onFile(done, total, rel);
             }
@@ -180,12 +180,12 @@ namespace JiguSetup
         {
             try
             {
-                Dictionary<string, string> table = InstallerPayload.Table();
-                string b64;
+                Dictionary<string, byte[]> table = InstallerPayload.Table();
+                byte[] bytes;
                 string key = SetupInfo.IconFileName;
-                if (!table.TryGetValue(key, out b64)) return null;
+                if (!table.TryGetValue(key, out bytes)) return null;
                 string path = Path.Combine(targetDir, SetupInfo.IconFileName);
-                File.WriteAllBytes(path, Convert.FromBase64String(b64));
+                File.WriteAllBytes(path, bytes);
                 return path;
             }
             catch { return null; }
@@ -719,7 +719,7 @@ namespace JiguSetup
             HashSet<string> ours = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
-                foreach (KeyValuePair<string, string> kv in InstallerPayload.Table())
+                foreach (KeyValuePair<string, byte[]> kv in InstallerPayload.Table())
                 {
                     string key = (kv.Key ?? "").Replace('\\', '/').TrimStart('/');
                     if (key.Length > 0) ours.Add(key);

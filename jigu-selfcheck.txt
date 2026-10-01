@@ -1,5 +1,5 @@
 == 稽古 自检 ==
-版本     : v0.3.1
+版本     : v0.4.0
 系统     : Windows 10.0.26200(Win11) / x64 / .NET 4.0.30319.42000
 程序目录 : D:\DSH\jigu-app_new\jigu-app\dist\稽古\
 WebView2 : 已安装 registry:154.0.4258.48

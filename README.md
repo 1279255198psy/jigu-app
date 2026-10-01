@@ -436,13 +436,16 @@ csc -nologo -out:ParseCheck.exe ParseCheck.cs ..\src\Json.cs ..\src\MiniJson.cs
 
 `UninstallCheck` 特殊一点：它要和**安装向导那一遍的源码**编在一起（要读真的载荷键表，
 并经反射调用 `UninstallForm` 的私有判定方法；`UninstallForm` 在 `JiguSetup` 命名空间，
-`InstallerPayload` 在 `Jigu`）：
+`InstallerPayload` 在 `Jigu`）。载荷键表来自 `/resource:` 的那个 zip —— 所以这条命令
+要先跑过 `build.ps1`（`obj\payload.setup.zip` 是它生成的），漏掉 `/resource:` 时探针会
+直接报「载荷键表为空」而不是在空夹具上假绿：
 
 ```
 csc -nologo -out:UninstallCheck.exe /main:Jigu.UninstallCheck UninstallCheck.cs ^
     ..\src\Installer.cs ..\src\SetupAssemblyInfo.cs ..\src\Host.cs ..\src\Update.cs ^
-    ..\src\Json.cs ..\src\MiniJson.cs ..\src\Corpus.cs ..\src\PayloadExt.cs ^
-    ..\src\InstallerPayload.g.cs ..\src\EmbeddedAssets.g.cs ..\src\Version.g.cs ^
+    ..\src\Json.cs ..\src\MiniJson.cs ..\src\Corpus.cs ..\src\Library.cs ..\src\PayloadExt.cs ^
+    ..\src\EmbeddedAssets.g.cs ..\src\Version.g.cs ^
+    /resource:..\obj\payload.setup.zip,Jigu.payload.zip ^
     /reference:System.Windows.Forms.dll /reference:Microsoft.Web.WebView2.Core.dll ^
     /reference:Microsoft.Web.WebView2.WinForms.dll
 ```
