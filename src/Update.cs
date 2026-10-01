@@ -1511,14 +1511,62 @@ namespace Jigu
             catch (Exception ex) { Log.Error("cleanup strays", ex); }
         }
 
+        /// <summary>更新提示的标题，两次询问共用</summary>
+        private const string UpdateTitle = "稽古 · 软件更新";
+
+        /// <summary>更新说明整段进弹窗，前后都要留空行。没有说明时不加这一节。</summary>
+        private static string NotesBlock(Report r)
+        {
+            return string.IsNullOrEmpty(r.Notes) ? "" : ("\r\n\r\n本次更新内容：\r\n" + r.Notes);
+        }
+
+        private static string SizeText(Report r)
+        {
+            return r.Size > 0
+                ? ("（约 " + (r.Size / 1048576.0).ToString("0.0", CultureInfo.InvariantCulture) + " MB）")
+                : "";
+        }
+
+        /// <summary>
+        /// 刚发现新版本时的第一问。此时包**还没下载**，问的是「要不要现在开始下」；
+        /// 和 AskUser（包已下好，问要不要重启）不是一回事，所以文案必须区分开。
+        /// 答「是」之后下载在后台进行，下完还会再问一次是否立即重启。
+        /// mandatory 为真时不给「不要」，只能确认。
+        /// </summary>
+        public static bool AskDownload(Report r, IWin32Window owner)
+        {
+            string tail = r.Mandatory
+                ? "\r\n\r\n这是必须安装的更新。点「确定」后立即在后台下载，下载完成后会提示你重启生效。"
+                : "\r\n\r\n点「是」现在就在后台下载，期间可以照常检索，下载完成后会再问你是否立即重启；"
+                  + "点「否」这次先不更新，下次启动时再问你。";
+            string msg = "检测到新版本 v" + r.RemoteVersion + SizeText(r)
+                + "（当前 v" + AppVer.Number + "）。" + NotesBlock(r) + tail;
+            DialogResult dr = MessageBox.Show(owner, msg, UpdateTitle,
+                r.Mandatory ? MessageBoxButtons.OK : MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information);
+            return r.Mandatory || dr == DialogResult.Yes;
+        }
+
+        /// <summary>
+        /// 用户点头要更新、下载却失败时的交代。这条路径原先只写日志，用户等几分钟什么
+        /// 也看不到（实测里是下载完才发现哈希不符）。给一次重试，别让他再去界面上找。
+        /// </summary>
+        public static bool AskRetryDownload(Report r, IWin32Window owner)
+        {
+            string msg = "新版本 v" + r.RemoteVersion + " 下载失败（当前 v" + AppVer.Number + "）。"
+                + "\r\n\r\n网络不稳或下载到的文件没通过校验都会这样，当前版本可以照常用。"
+                + "\r\n\r\n点「是」再试一次；点「否」这次先不更新，下次启动时再问你。";
+            return MessageBox.Show(owner, msg, UpdateTitle,
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
+        }
+
         /// <summary>
         /// 更新就绪提示。此时包**已经下载并校验完毕**，这里只是问要不要现在重启 ——
         /// 所以文案是「已下载完成」而不是「是否现在更新」，用户不必再等下载。
         /// mandatory 为真时不给「稍后」，只能确认。
         /// </summary>
-        public static bool AskUser(Report r)
+        public static bool AskUser(Report r, IWin32Window owner)
         {
-            string notes = string.IsNullOrEmpty(r.Notes) ? "" : ("\r\n\r\n本次更新内容：\r\n" + r.Notes);
             string size = r.Size > 0
                 ? ("（" + (r.Size / 1048576.0).ToString("0.0", CultureInfo.InvariantCulture) + " MB）")
                 : "";
@@ -1526,8 +1574,8 @@ namespace Jigu
                 ? "\r\n\r\n这是必须安装的更新。点「确定」后程序会自动重启并完成更新。"
                 : "\r\n\r\n点「是」立即重启更新；点「否」这次先不更新，下次启动时再问你。";
             string msg = "新版本 v" + r.RemoteVersion + " 已下载完成" + size
-                + "（当前 v" + AppVer.Number + "）。" + notes + tail;
-            DialogResult dr = MessageBox.Show(msg, "稽古 · 软件更新",
+                + "（当前 v" + AppVer.Number + "）。" + NotesBlock(r) + tail;
+            DialogResult dr = MessageBox.Show(owner, msg, UpdateTitle,
                 r.Mandatory ? MessageBoxButtons.OK : MessageBoxButtons.YesNo,
                 MessageBoxIcon.Information);
             return r.Mandatory || dr == DialogResult.Yes;

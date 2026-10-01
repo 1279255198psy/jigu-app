@@ -496,6 +496,12 @@ namespace Jigu
         // 以后每个版本都会被当成「已忽略」——横幅不播、稍後按钮不显示、弹框也不再弹。
         private volatile string _appSnoozed = "";     // 用户点过「稍后」的那个版本
         private volatile string _appNotified = "";    // 已经弹过就绪提示的那个版本
+        // 「刚发现新版本」那一问的记录，与 _appNotified 是两回事：前者问要不要下载，
+        // 后者问要不要重启。合成一个字段的话，用户答完第一问，第二问就被自己挡掉了。
+        private volatile string _appAsked = "";       // 已经弹过「检测到新版本」的那个版本
+        // 用户明确说过「现在更新」的那个版本。它只用来决定下载失败要不要吭声：
+        // 用户点头之后才值得打扰，后台复查自己默默下的那些失败就算了。
+        private volatile string _appApproved = "";
         private System.Threading.Timer _recheck;      // 常驻时的周期性复查
         private int _checking;                        // 检查重入保护
 
@@ -565,7 +571,8 @@ namespace Jigu
                     if (pending != null) SetAppUpdateReady(pending, AppUpdater.PendingPath(baseDir));
                 }
                 catch (Exception ex) { Log.Error("find pending update", ex); }
-                try { SilentUpdate(); }
+                // 启动这一趟：发现新版本要弹框问用户，而不是等下完再问
+                try { SilentUpdate(true); }
                 catch (Exception ex) { Log.Error("SilentUpdate", ex); }
             });
         }
@@ -677,7 +684,8 @@ namespace Jigu
                     {
                         // 正在退出或正在替换文件时不做任何网络工作
                         if (_reallyExit || IsDisposed || _appPhase == "applying") return;
-                        SilentUpdate();
+                        // 定时复查不弹框：用户可能正检索到一半，被打断比晚点知道更烦人
+                        SilentUpdate(false);
                     }
                     catch (Exception ex) { Log.Error("recheck", ex); }
                 }, null, RecheckIntervalMs, RecheckIntervalMs);
@@ -1036,10 +1044,13 @@ namespace Jigu
 
         // ================= 程序本体更新 =================
         //
-        // 分两段，为的是不让用户干等下载：
-        //   1) 后台线程：检查 + 静默预下载（不提示任何东西）→ 就绪
-        //   2) 就绪后才弹一次「已下载完成，现在重启更新吗？」→ 应用，或留到下次启动
+        // 分两问，为的都是不让用户干等下载：
+        //   1) 启动检查一发现新版本就弹「检测到新版本，要现在下载吗？」—— 只花一次检查的
+        //      时间（几秒），不像以前要等整包下完才吭声。答「是」转后台下载，答「否」这一
+        //      版本次会话就不再提，也不偷偷占带宽。
+        //   2) 包下好、校验过，才弹第二次「已下载完成，现在重启更新吗？」→ 应用。
         // 点「稍后」不清 pending：下次启动会由 FindPending 重新发现并再问一次。
+        // 定时复查（每 6 小时那趟）只走静默预下载，不在用户检索到一半时弹框。
         //
         // 状态放在 _appPhase / _appReady 上而不是局部变量里：下载在后台线程跑，
         // 而确认框、按钮、轮询都在界面线程上。
@@ -1079,8 +1090,11 @@ namespace Jigu
             try { m.Dispose(); } catch { }
         }
 
-        /// <summary>静默更新：先数据，再检查程序本体的新版本并后台预下载。全程不打扰用户。</summary>
-        private void SilentUpdate()
+        /// <summary>
+        /// 后台更新检查。史料通道永远静默；程序本体这条看 promptOnDetect：
+        /// 启动那一趟（true）发现新版本就弹框问用户，定时复查（false）照旧静默预下载。
+        /// </summary>
+        private void SilentUpdate(bool promptOnDetect)
         {
             // 启动那次与定时复查可能撞车；重叠没有意义，让后来者直接退出
             if (Interlocked.CompareExchange(ref _checking, 1, 0) != 0) return;
@@ -1088,15 +1102,33 @@ namespace Jigu
             {
                 // 每轮开头丢掉 Release 缓存，好让史料与程序两次检查共用一次 API 请求
                 UpdateSource.Reset();
-                RunDataCheck(true);
 
-                if (_appReady != null) return;             // 已经有下好的包，不必再查
-                AppUpdater.Report app = AppUpdater.Check();
-                if (app.Checked && app.Available)
+                // 程序本体的检查排在最前面：启动那一趟要尽快把「检测到新版本」摆到用户面前，
+                // 而史料通道这一趟可能带着几 MB 的下载，排在前面就把弹框压成了「过很久才弹」。
+                if (_appReady == null)                     // 已经有下好的包，不必再查
                 {
-                    Log.Write("app update available: v" + app.RemoteVersion + "，开始后台下载");
-                    DownloadAppInBackground(app);
+                    AppUpdater.Report app = AppUpdater.Check();
+                    if (app.Checked && app.Available)
+                    {
+                        if (string.Equals(_appSnoozed, app.RemoteVersion, StringComparison.OrdinalIgnoreCase))
+                        {
+                            // 用户这次会话已经说过「不要」：既不再问，也不偷偷下
+                            Log.Write("app update skipped (snoozed): v" + app.RemoteVersion);
+                        }
+                        else if (promptOnDetect)
+                        {
+                            Log.Write("app update detected: v" + app.RemoteVersion + "，交给界面线程询问");
+                            PromptNewVersionFound(app);
+                        }
+                        else
+                        {
+                            Log.Write("app update available: v" + app.RemoteVersion + "，开始后台下载");
+                            DownloadAppInBackground(app);
+                        }
+                    }
                 }
+
+                RunDataCheck(true);
             }
             catch (Exception ex) { Log.Error("SilentUpdate", ex); }
             finally { Interlocked.Exchange(ref _checking, 0); }
@@ -1131,6 +1163,7 @@ namespace Jigu
                         // 半截包必须清掉：否则下次启动会把它当成一个有效的待应用更新
                         AppUpdater.DeletePending(baseDir);
                         _appPhase = "idle";
+                        NotifyDownloadFailed(r);
                         return;
                     }
                     SetAppUpdateReady(r, pkg);
@@ -1139,6 +1172,7 @@ namespace Jigu
                 {
                     Log.Error("DownloadAppInBackground", ex);
                     _appPhase = "idle";
+                    NotifyDownloadFailed(r);
                 }
                 finally
                 {
@@ -1146,6 +1180,31 @@ namespace Jigu
                     guard.Dispose();
                 }
             });
+        }
+
+        /// <summary>
+        /// 用户点过「是」（或点过「立即更新」）之后下载失败：不能再装死。
+        /// 之前这条路径只写日志，而实测里 48 MB 下了六分钟才报哈希不符 —— 用户等到的
+        /// 只有沉默，只好自己去点「检查版本」才明白发生了什么。说一句，并给一次重试。
+        /// 只有用户明确要过这次更新才打扰；定时复查的静默下载失败仍然安静地留到下一轮。
+        /// </summary>
+        private void NotifyDownloadFailed(AppUpdater.Report r)
+        {
+            if (!string.Equals(_appApproved, r.RemoteVersion, StringComparison.OrdinalIgnoreCase)) return;
+            try
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    _appApproved = "";                    // 只报一次，别在几小时后的复查里再翻出来
+                    if (AppUpdater.AskRetryDownload(r, this))
+                    {
+                        _appApproved = r.RemoteVersion;   // 重试再失败还要再报
+                        Log.Write("app update retry: v" + r.RemoteVersion);
+                        DownloadAppInBackground(r);
+                    }
+                });
+            }
+            catch (Exception ex) { Log.Error("NotifyDownloadFailed", ex); }
         }
 
         /// <summary>标记「已下载待重启」，并在界面线程弹一次确认框</summary>
@@ -1159,6 +1218,41 @@ namespace Jigu
             catch (Exception ex) { Log.Error("SetAppUpdateReady", ex); }
         }
 
+        /// <summary>
+        /// 「检测到新版本」的第一问（界面线程）。此时包还没下载，问的是要不要现在下。
+        /// 答「是」才转后台下载，下完再由 PromptReadyUpdate 问第二遍（要不要重启）；
+        /// 答「否」记下这一版，本会话不再问也不再下 —— 下次启动重新问。
+        /// </summary>
+        private void PromptNewVersionFound(AppUpdater.Report r)
+        {
+            try
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    // 排队这段时间里用户可能已经点过「稍后」，或被别处问过一遍
+                    if (string.Equals(_appSnoozed, r.RemoteVersion, StringComparison.OrdinalIgnoreCase)) return;
+                    if (string.Equals(_appAsked, r.RemoteVersion, StringComparison.OrdinalIgnoreCase)) return;
+                    _appAsked = r.RemoteVersion;
+                    if (AppUpdater.AskDownload(r, this))
+                    {
+                        Log.Write("app update accepted: v" + r.RemoteVersion + "，开始后台下载");
+                        _appApproved = r.RemoteVersion;
+                        DownloadAppInBackground(r);
+                    }
+                    else
+                    {
+                        SnoozeAppUpdate(r.RemoteVersion);
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                // 弹不出框也不能把更新卡死：退回静默预下载，至少下次启动时包是现成的
+                Log.Error("PromptNewVersionFound", ex);
+                DownloadAppInBackground(r);
+            }
+        }
+
         /// <summary>就绪提示（界面线程）。同一个版本只主动弹一次，用户点过「稍后」的不再弹。</summary>
         private void PromptReadyUpdate()
         {
@@ -1168,7 +1262,7 @@ namespace Jigu
             if (string.Equals(_appNotified, r.RemoteVersion, StringComparison.OrdinalIgnoreCase)) return;
             if (string.Equals(_appSnoozed, r.RemoteVersion, StringComparison.OrdinalIgnoreCase)) return;
             _appNotified = r.RemoteVersion;
-            if (AppUpdater.AskUser(r)) ApplyReadyUpdate();
+            if (AppUpdater.AskUser(r, this)) ApplyReadyUpdate();
         }
 
         /// <summary>应用已下载的包：拉起替换助手 → 真正退出 → 由助手换文件并重启</summary>
@@ -1259,6 +1353,8 @@ namespace Jigu
                 UpdateSource.Reset();
                 AppUpdater.Report r = AppUpdater.Check();
                 if (!r.Available) return AppReportJson(r, "idle", r.Message);
+                // 用户是在界面上主动点的「立即更新」，失败了同样不能装死
+                _appApproved = r.RemoteVersion;
                 DownloadAppInBackground(r);
                 return AppReportJson(r, "downloading", "正在后台下载更新…");
             }
