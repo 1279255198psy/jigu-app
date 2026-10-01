@@ -53,10 +53,25 @@
       </nav>
     </header>
 
-    <div id="status" class="statusline"><span class="pulse"></span><span>正在备书…</span></div>
+    <div class="statusbar">
+      <div id="status" class="statusline"><span class="pulse"></span><span>正在备书…</span></div>
+      <!-- 一部史书都没勾时才出现：分册已经在本地，只是没读进内存。
+           说清楚比让用户对着「已备 201 则」瞎猜强。 -->
+      <button id="lib-cta" class="link" type="button" style="display:none">去藏书阁选书 →</button>
+    </div>
 
     <main class="main">
       <div id="view-search">
+        <!-- 首次运行只出现一次；看过就写进 localStorage，不再打扰 -->
+        <div id="guide" class="guide" style="display:none">
+          <p class="guide-text">二十四史全文已随程序装在本地，<b>不联网</b>即可检索。
+            它们默认不会全部读进内存 —— 到「藏书阁」勾选想用的史书，检索才会用上。</p>
+          <div class="row">
+            <button id="guide-go" class="seal-btn" type="button">去藏书阁选书</button>
+            <button id="guide-close" class="ghost" type="button">知道了</button>
+          </div>
+        </div>
+
         <section class="scroll">
           <div class="rod"></div>
           <div class="scroll-body">
@@ -65,7 +80,7 @@
               placeholder="写下你此刻的处境……"></textarea>
             <div class="row">
               <button id="go" class="seal-btn" type="button" disabled>稽古一问</button>
-              <span class="hint">Ctrl / ⌘ + Enter</span>
+              <span class="hint">Enter 检索 · Shift + Enter 换行</span>
             </div>
           </div>
           <div class="rod"></div>

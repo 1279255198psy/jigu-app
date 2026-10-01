@@ -1622,7 +1622,10 @@ namespace Jigu
                         if (i > 0) sb.Append(',');
                         sb.Append('"').Append(Json.Escape(terms[i])).Append('"');
                     }
-                    sb.Append("]}");
+                    // 同义词桥的全貌：用户说的哪句话被理解成了哪个情境标签。
+                    // 只讲「切成哪些词元」解释不了「为什么这条跟你有关」，
+                    // 而这一层恰恰是用户最看不懂、也最需要看懂的地方。
+                    sb.Append("],\"bridge\":").Append(corpus.BridgeToJson(norm)).Append('}');
                     return sb.ToString();
                 }
                 catch (Exception ex)
@@ -1987,7 +1990,14 @@ namespace Jigu
             AcceptButton = null;
             _input.KeyDown += delegate(object s, KeyEventArgs e)
             {
-                if (e.Control && e.KeyCode == Keys.Enter) { DoSearch(); e.SuppressKeyPress = true; }
+                // 输入法组字阶段（拼音候选还没上屏）的回车是「选字」，不是「提交」。
+                // WinForms 把它报成 ProcessKey(229)；少了这条判断，拼音打一半按回车
+                // 就会把半截拼音送进检索。网页界面那边用 isComposing 判同一件事。
+                if (e.KeyCode == Keys.ProcessKey) return;
+                if (e.KeyCode != Keys.Enter || e.Alt) return;
+                if (e.Shift) return;                 // Shift + Enter 留给换行
+                DoSearch();
+                e.SuppressKeyPress = true;           // 否则多行输入框还会再插一个换行
             };
         }
 
@@ -1998,10 +2008,16 @@ namespace Jigu
                 // 内置界面没有藏书阁，但勾选记录是共用的：用户在外面的藏书阁选过的史书，
                 // 掉到内置界面也该查得到，否则换个界面同样的词给出不一样的 Top3。
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                List<string> sel = Library.LoadSelection(baseDir, null);
                 Corpus c = new Corpus();
-                c.LoadFrom(baseDir, Library.ShardPaths(baseDir, Library.LoadSelection(baseDir, null)));
+                c.LoadFrom(baseDir, Library.ShardPaths(baseDir, sel));
                 _corpus = c;
-                ShowStatus("书库已就绪：" + c.DocCount + " 条史料 · " + c.TermCount + " 个索引词");
+                string line = "书库已就绪：" + c.DocCount + " 条史料 · " + c.TermCount + " 个索引词";
+                // 内置界面里没有藏书阁，但分册确实躺在本地。一部都没勾时说清楚去哪儿勾，
+                // 否则用户看到「201 条」只会以为软件就这么大。
+                if (sel.Count == 0 && Library.IsInstalled(baseDir))
+                    line += "（未加载史书分册，可在网页界面的藏书阁勾选）";
+                ShowStatus(line);
             }
             catch (Exception ex)
             {
@@ -2147,7 +2163,9 @@ namespace Jigu
             meta.Font = SafeFont.Kai(9.5f);
             meta.ForeColor = Color.FromArgb(140, 130, 114);
             meta.Margin = new Padding(0, 0, 0, 8);
-            meta.Text = "第 " + rank + " 条 · 相关度 " + (hit == null ? 0d : Math.Round(hit.Score, 1))
+            // 档位前缀：数据里没有分级时 d.Verdict 是空串，这行原样不动。
+            meta.Text = (d != null && !string.IsNullOrEmpty(d.Verdict) ? "〔" + d.Verdict + "策〕" : "")
+                + "第 " + rank + " 条 · 相关度 " + (hit == null ? 0d : Math.Round(hit.Score, 1))
                 + (d != null && d.Chapter != null && d.Chapter.Length > 0 ? " · " + d.Chapter : "");
             grid.Controls.Add(meta, 0, 1);
             grid.SetColumnSpan(meta, 2);
@@ -2164,6 +2182,13 @@ namespace Jigu
                 Color.FromArgb(70, 66, 58), false);
             AddField(grid, ref row, width, "最终结果", d == null ? "" : d.Outcome,
                 Color.FromArgb(110, 60, 50), false);
+            // 「判为」= 构建期给这条定的上/中/下判据。没有标注就不加这一行，不留空行。
+            //
+            // 这里**故意不做**网页那套三栏上中下：内置界面是网页起不来时的兜底路径，
+            // 正常用户看不到，为它复刻一套手写 WinForms 三栏布局，收益不抵维护成本。
+            // 明确的取舍，不是遗漏 —— 档位与判据照样显示，只是按相关度纵向排列。
+            if (d != null && !string.IsNullOrEmpty(d.VerdictWhy))
+                AddField(grid, ref row, width, "判为", d.VerdictWhy, Color.FromArgb(110, 60, 50), false);
 
             card.Controls.Add(grid);
             return card;

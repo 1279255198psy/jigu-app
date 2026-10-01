@@ -189,6 +189,18 @@ namespace Jigu
                     case "themes": doc.Themes = ReadStringArray(text, ref i); break;
                     case "pros": doc.Pros = ReadStringArray(text, ref i); break;
                     case "cons": doc.Cons = ReadStringArray(text, ref i); break;
+                    // 标注字段。default 是 SkipValue，所以旧程序读新分片、
+                    // 新程序读没有标注的旧分片，两个方向都不会炸。
+                    case "cast": doc.Cast = ReadStringArray(text, ref i); break;
+                    case "cause": doc.Cause = ReadString(text, ref i); break;
+                    case "process": doc.Process = ReadString(text, ref i); break;
+                    case "significance": doc.Significance = ReadString(text, ref i); break;
+                    // 分级。取值经过归一：只认字面的上/中/下，其余一律归空 ——
+                    // 模型会自创「上策」「优」这类写法，放行会在运行时造出一个
+                    // 匹配不到 TierOrder 的幽灵档位；归空等于「没标注」，天然退化。
+                    case "verdict": doc.Verdict = Corpus.NormalizeVerdict(ReadString(text, ref i)); break;
+                    case "verdictWhy":
+                    case "verdict_why": doc.VerdictWhy = ReadString(text, ref i); break;
                     default: SkipValue(text, ref i); break;
                 }
             }

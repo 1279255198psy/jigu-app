@@ -118,7 +118,9 @@
       var index = {};
       docs.forEach(function (d, i) {
         var text = [d.book, d.chapter, d.title, d.original, d.translation,
-          d.decision, d.outcome, (d.figures || []).join(""), (d.themes || []).join("")].join("");
+          d.decision, d.outcome, d.cause, d.process, d.significance,
+          (d.figures || []).join(""), (d.themes || []).join(""),
+          (d.cast || []).join("")].join("");
         var n = text.length, seen = {};
         for (var j = 0; j + 2 <= n; j++) {
           var t = text.substr(j, 2);
@@ -145,17 +147,48 @@
       });
       var ranked = Object.keys(score).map(function (d) { return { i: +d, s: score[d] }; });
       ranked.sort(function (a, b) { return b.s - a.s || a.i - b.i; });
-      var hits = ranked.slice(0, topK || 3).map(function (r) {
+      var toHit = function (r) {
         var d = C.docs[r.i];
         return {
           book: d.__book || "", chapter: d.chapter || "", title: d.title || "",
           original: d.original || "", translation: d.translation || "",
           figures: d.figures || [], decision: d.decision || "",
           outcome: d.outcome || "", score: Math.round(r.s * 10) / 10,
-          themes: d.themes || [], pros: d.pros || [], cons: d.cons || []
+          themes: d.themes || [], pros: d.pros || [], cons: d.cons || [],
+          cast: d.cast || [], cause: d.cause || "", process: d.process || "",
+          significance: d.significance || "",
+          // 分级字段：离线语料目前一条档位都没有，全是空串 —— 如实留空，
+          // 界面据此走「三次相似的处境」那条退化路径。
+          verdict: d.verdict || "", verdictWhy: d.verdictWhy || "",
+          // 离线引擎不做同义词桥（那在 C# 里），所以没有「为什么给你看这条」。
+          why: []
         };
-      });
-      return { hits: hits, terms: Object.keys(terms), elapsedMs: 0, local: true };
+      };
+      // 分档选取，规则与 C# 的 Corpus.SearchByVerdict 一致：在相关度下限之上的
+      // 候选池里，每档取分最高的那条，按 上→中→下 输出，缺档就不出现。
+      // 真机上这一步在 C# 里做；离线这条路径本来用不到，但预览页（make-preview.ps1
+      // 的 -WithVerdicts）要在不跑程序的情况下验收三栏排版，所以这里必须有。
+      var verdictDocs = 0, di;
+      for (di = 0; di < C.docs.length; di++) if (C.docs[di].verdict) verdictDocs++;
+      var picked = ranked.slice(0, topK || 3), tiers = [], graded = false;
+      if (verdictDocs > 0 && ranked.length) {
+        var pool = ranked.slice(0, 200), top = pool[0].s, byTier = {};
+        for (di = 0; di < pool.length && pool[di].s >= top * 0.35; di++) {
+          var v = C.docs[pool[di].i].verdict;
+          if (v && !byTier[v]) byTier[v] = pool[di];
+        }
+        var chosen = [];
+        for (di = 0; di < TIER_ORDER.length; di++) {
+          var r0 = byTier[TIER_ORDER[di]];
+          tiers.push({ verdict: TIER_ORDER[di], hit: r0 ? chosen.length : -1 });
+          if (r0) chosen.push(r0);
+        }
+        if (chosen.length) { picked = chosen; graded = true; }
+        else tiers = [];
+      }
+      var hits = picked.map(toHit);
+      return { hits: hits, terms: Object.keys(terms), elapsedMs: 0, local: true,
+        graded: graded, tiers: tiers, verdictDocs: verdictDocs };
     });
   }
 
@@ -171,7 +204,9 @@
     if (name === "ExplainSearch") {
       var q = String(args[0] || ""), t = {}, i;
       for (i = 0; i + 2 <= q.length; i++) t[q.substr(i, 2)] = 1;
-      return Promise.resolve({ normalized: q, terms: Object.keys(t) });
+      // bridge 是空数组而不是不填：离线引擎没有同义词桥（那在 C# 里），
+      // 如实说「没理解出什么」，不要编。
+      return Promise.resolve({ normalized: q, terms: Object.keys(t), bridge: [] });
     }
     if (name === "CorpusStats") return localStats();
     // 离线（页面被系统浏览器直接打开）时没有分册概念：只说「没装」，不要编一份书目出来
@@ -227,6 +262,24 @@
     s.title = "稽古";
     return s;
   }
+  // 情境词与用户输入的重合点亮，三栏概览与决策分析栏共用同一套判据 ——
+  // 两处各写一遍的话，日后改一处忘一处，同一个词在两个地方会有两种亮法。
+  function situationLine(themes, query, leadText) {
+    if (!themes || !themes.length) return null;
+    var q = String(query || "");
+    var lead = el("p", "analysis-lead");
+    lead.appendChild(el("span", "muted", leadText));
+    var chips = el("span", "chips inline");
+    for (var i = 0; i < themes.length; i++) {
+      var t = String(themes[i]);
+      var on = q.length >= 2 && q.indexOf(t) >= 0;
+      var c = el("span", on ? "chip chip-on" : "chip chip-off", on ? "✓ " + t : t);
+      if (on) c.title = "你的描述里出现了这个词";
+      chips.appendChild(c);
+    }
+    lead.appendChild(chips);
+    return lead;
+  }
   // 决策分析栏：利/弊正文是随语料写好的（离线、不调用 AI），只有「与你的处境对应」
   // 这一行是运行时算的 —— 看这条史料的哪些情境词原样出现在用户输入里。
   function analysisBlock(hit, query) {
@@ -234,22 +287,8 @@
     if (!pros.length && !cons.length) return null;
     var wrap = el("section", "block analysis");
     wrap.appendChild(el("h4", null, "决策分析"));
-    var q = String(query || "");
-    var themes = hit.themes || [];
-    if (themes.length) {
-      var lead = el("p", "analysis-lead");
-      lead.appendChild(el("span", "muted", q ? "与你的处境对应：" : "本条情境："));
-      var chips = el("span", "chips inline");
-      for (var i = 0; i < themes.length; i++) {
-        var t = String(themes[i]);
-        var on = q.length >= 2 && q.indexOf(t) >= 0;
-        var c = el("span", on ? "chip chip-on" : "chip chip-off", on ? "✓ " + t : t);
-        if (on) c.title = "你的描述里出现了这个词";
-        chips.appendChild(c);
-      }
-      lead.appendChild(chips);
-      wrap.appendChild(lead);
-    }
+    var line = situationLine(hit.themes, query, query ? "与你的处境对应：" : "本条情境：");
+    if (line) wrap.appendChild(line);
     var grid = el("div", "grid-2");
     var pu = el("ul", "pros");
     if (pros.length) for (var p = 0; p < pros.length; p++) pu.appendChild(el("li", null, pros[p]));
@@ -264,36 +303,168 @@
       "这两栏是史事本身的条件与代价，不是结论。哪一边更重，取决于你的实际情况与上面那几个词是否成立。"));
     return wrap;
   }
-  function renderHit(hit, index, query) {
-    var card = el("article", "hit-card");
-    var head = el("header", "hit-head");
-    head.appendChild(el("span", "rank", "#" + (index + 1)));
-    var tb = el("div", "hit-title");
-    tb.appendChild(el("h3", null, hit.title || hit.chapter || "（无标题）"));
-    tb.appendChild(el("p", "hit-sub", (hit.book || "史料") + "·" + (hit.chapter || "")));
-    head.appendChild(tb);
-    if (typeof hit.score === "number") {
-      var sc = el("div", "score", hit.score.toFixed(2));
+  // 关键决策正文：decision 是一句话概括，cause / process 是标注补上的起因与经过。
+  // 老数据只有 decision，那就只渲染那一句，不硬凑空行。
+  function decisionBody(hit) {
+    var wrap = el("div", "decision-body");
+    if (hit.decision) wrap.appendChild(el("p", "prose", hit.decision));
+    else if (!hit.cause && !hit.process) wrap.appendChild(el("p", "prose muted", "未标注"));
+    if (hit.cause) wrap.appendChild(annoRow("起 因", hit.cause));
+    if (hit.process) wrap.appendChild(annoRow("经 过", hit.process));
+    return wrap;
+  }
+  function annoRow(label, text) {
+    var p = el("p", "anno-row");
+    p.appendChild(el("span", "anno-label", label));
+    p.appendChild(el("span", "anno-text", text));
+    return p;
+  }
+  // 「为什么给你看这条」：把用户原话与被理解成的情境并列。这是同义词桥唯一
+  // 露出水面的地方 —— 打分早就用了它，但用户此前看不到，于是觉得结果「意义不明」。
+  function whyBlock(why) {
+    if (!why || !why.length) return null;
+    var ul = el("ul", "why-list");
+    for (var i = 0; i < why.length; i++) {
+      var li = el("li", null, "");
+      li.appendChild(el("span", "why-said", "你说到「" + why[i].said + "」"));
+      li.appendChild(el("span", "why-arrow", "→"));
+      li.appendChild(el("span", "why-label", why[i].label));
+      ul.appendChild(li);
+    }
+    return block("为什么给你看这条", ul);
+  }
+  // 处境识别条：摆在结果最前面，先说「我们听懂了什么」，再给史料。
+  // 全部命中都没有 why 时整条不出现，不留空壳。
+  function situationStrip(hits) {
+    var pairs = [], seen = {};
+    for (var i = 0; i < hits.length && pairs.length < 8; i++) {
+      var why = hits[i].why || [];
+      for (var j = 0; j < why.length && pairs.length < 8; j++) {
+        var k = why[j].said + "\u0000" + why[j].label;
+        if (seen[k]) continue;
+        seen[k] = 1;
+        pairs.push(why[j]);
+      }
+    }
+    if (!pairs.length) return null;
+    var strip = el("div", "situation-strip");
+    strip.appendChild(el("span", "situation-lead", "你的描述里认出了："));
+    var chips = el("span", "chips inline");
+    for (var m = 0; m < pairs.length; m++) {
+      chips.appendChild(el("span", "chip chip-syn",
+        "「" + pairs[m].said + "」→ " + pairs[m].label));
+    }
+    strip.appendChild(chips);
+    return strip;
+  }
+  function clip(text, n) {
+    var s = String(text || "");
+    if (s.length <= n) return s;
+    return s.substr(0, n) + "…";
+  }
+  // 展开后的全文。概览栏已经显示过「怎么做」「结果如何」，这里不重复，
+  // 只补原文、译文、人物、现实意义、利弊 —— 两处都调 block()，排版不会漂移。
+  function renderHitDetail(hit, query) {
+    var wrap = el("div", "hit-detail");
+    wrap.appendChild(block("原文摘录", el("blockquote", "quote", hit.original || "（未收录原文）")));
+    wrap.appendChild(block("现代文翻译", el("p", "prose", hit.translation || "（该条暂无白话译文）")));
+    // 核心人物：cast 带身份角色（「项羽（西楚霸王·主帅）」），201 条精选只有 figures
+    // 且是人名裸串。cast 非空就用 cast，否则回落 figures —— 精选那边完全不受影响。
+    var cast = (hit.cast && hit.cast.length) ? hit.cast : hit.figures;
+    var figs = el("ul", "figures" + (hit.cast && hit.cast.length ? " cast" : ""));
+    if (cast && cast.length) {
+      for (var i = 0; i < cast.length; i++) figs.appendChild(el("li", null, cast[i]));
+    } else figs.appendChild(el("li", "muted", "未标注"));
+    wrap.appendChild(block("核心人物", figs));
+    // 现实意义与「决策分析（利/弊）」并列但独立：前者是这条史料对当下的启发，
+    // 后者是史事本身的条件与代价。没有标注的条目整块不出现，不留空壳。
+    if (hit.significance) {
+      wrap.appendChild(block("现实意义", el("p", "prose significance", hit.significance)));
+    }
+    var an = analysisBlock(hit, query);
+    if (an) wrap.appendChild(an);
+    if (hit.terms && hit.terms.length) wrap.appendChild(block("命中词元", chipList(hit.terms)));
+    wrap.appendChild(sealCorner());
+    return wrap;
+  }
+  var TIER_ORDER = ["上", "中", "下"];
+  var TIER_TEXT = { "上": "上策", "中": "中策", "下": "下策" };
+  var TIER_CLASS = { "上": "plan-up", "中": "plan-mid", "下": "plan-down" };
+  // 把 hits 摆成槽位。graded=false 时是按分数排的 N 条（徽章为序号），
+  // graded=true 时固定 上/中/下 三档，缺档就是空槽。
+  // 两种模式共用 renderPlanCol 这一条路径，差别只在徽章文字与是否空档 ——
+  // 所以「标注真跑起来」那天，界面不需要再改代码。
+  function resultSlots(data) {
+    var hits = (data && data.hits) ? data.hits : [];
+    var slots = [], i;
+    if (!(data && data.graded)) {
+      for (i = 0; i < hits.length; i++) slots.push({ hit: hits[i], badge: "#" + (i + 1), cls: "" });
+      return slots;
+    }
+    var byTier = {}, tiers = data.tiers || [];
+    for (i = 0; i < tiers.length; i++) {
+      var it = tiers[i];
+      if (it && typeof it.hit === "number" && it.hit >= 0 && it.hit < hits.length) {
+        byTier[it.verdict] = hits[it.hit];
+      }
+    }
+    for (i = 0; i < TIER_ORDER.length; i++) {
+      var v = TIER_ORDER[i];
+      slots.push({ hit: byTier[v] || null, badge: TIER_TEXT[v], cls: TIER_CLASS[v], verdict: v });
+    }
+    return slots;
+  }
+  function renderPlanCol(slot, query) {
+    var hit = slot.hit;
+    var col = el("article", "plan-col" + (slot.cls ? " " + slot.cls : "") + (hit ? "" : " empty"));
+    var head = el("header", "plan-head");
+    head.appendChild(el("span", "plan-badge" + (slot.cls ? " " + slot.cls : ""), slot.badge));
+    if (typeof hit !== "undefined" && hit && typeof hit.score === "number") {
+      var sc = el("span", "score", hit.score.toFixed(2));
       sc.title = "本地加权得分";
       head.appendChild(sc);
     }
-    card.appendChild(head);
-    if (hit.terms && hit.terms.length) card.appendChild(chipList(hit.terms));
-    card.appendChild(block("原文摘录", el("blockquote", "quote", hit.original || "（未收录原文）")));
-    card.appendChild(block("现代文翻译", el("p", "prose", hit.translation || "（该条暂无白话译文）")));
-    var grid = el("div", "grid-2");
-    var figs = el("ul", "figures");
-    if (hit.figures && hit.figures.length) {
-      for (var i = 0; i < hit.figures.length; i++) figs.appendChild(el("li", null, hit.figures[i]));
-    } else figs.appendChild(el("li", "muted", "未标注"));
-    grid.appendChild(block("核心人物", figs));
-    grid.appendChild(block("关键决策", el("p", "prose", hit.decision || "未标注")));
-    card.appendChild(grid);
-    card.appendChild(block("最终结果", el("p", "prose outcome", hit.outcome || "未标注")));
-    var an = analysisBlock(hit, query);
-    if (an) card.appendChild(an);
-    card.appendChild(sealCorner());
-    return card;
+    col.appendChild(head);
+    if (!hit) {
+      col.appendChild(el("p", "plan-empty-text", "这一档暂无贴切的史事。"));
+      col.appendChild(el("p", "plan-empty-note",
+        "宁缺勿凑 —— 硬塞一条与你处境无关的史料，比如实留空更糟。"));
+      return col;
+    }
+    var tb = el("div", "plan-title");
+    tb.appendChild(el("h3", null, hit.title || hit.chapter || "（无标题）"));
+    tb.appendChild(el("p", "hit-sub", (hit.book || "史料") + "·" + (hit.chapter || "")));
+    col.appendChild(tb);
+    // 档位判据只在有档位时才出现（没有标注的条目是空串）。
+    if (hit.verdict && hit.verdictWhy) {
+      col.appendChild(el("p", "plan-verdict-why",
+        (TIER_TEXT[hit.verdict] || "本档") + "：" + hit.verdictWhy));
+    }
+    var themed = situationLine(hit.themes, query, "当时的处境：");
+    if (themed) col.appendChild(themed);
+    var hasHow = !!(hit.decision || hit.cause || hit.process);
+    if (hasHow) col.appendChild(block("怎么做", decisionBody(hit)));
+    if (hit.outcome) col.appendChild(block("结果如何", el("p", "prose outcome", hit.outcome)));
+    // 没有标注的分片条目（只有原文与译文）概览几乎无话可说，给一段译文节选，
+    // 免得整栏只剩一个标题。全文仍在「展开」里。
+    if (!hasHow && !hit.outcome && !(hit.themes && hit.themes.length) && hit.translation) {
+      col.appendChild(block("白话译文（节选）", el("p", "prose", clip(hit.translation, 90))));
+    }
+    var why = whyBlock(hit.why);
+    if (why) col.appendChild(why);
+    var btn = el("button", "plan-expand", "展开全文");
+    btn.type = "button";
+    btn.setAttribute("aria-expanded", "false");
+    var detail = renderHitDetail(hit, query);
+    detail.hidden = true;
+    btn.addEventListener("click", function () {
+      detail.hidden = !detail.hidden;
+      btn.textContent = detail.hidden ? "展开全文" : "收起";
+      btn.setAttribute("aria-expanded", detail.hidden ? "false" : "true");
+    });
+    col.appendChild(btn);
+    col.appendChild(detail);
+    return col;
   }
   function renderResults(data, query) {
     var box = $("results");
@@ -308,12 +479,23 @@
       box.appendChild(el("p", "empty", "未找到相似的史事，可以换一种说法，或补充具体情境。"));
       return;
     }
+    var graded = !!(data && data.graded);
     var head = el("div", "section-title");
-    head.appendChild(el("h2", null, "镜 · 最相似的历史事件"));
-    head.appendChild(el("span", "hint",
-      (data && data.local) ? "离线兜底引擎检索所得（精度低于内置界面）" : "本机 C# 引擎检索所得"));
+    // 标题随数据升格：有档位才是「上中下三策」，否则如实叫「三次相似的处境」。
+    head.appendChild(el("h2", null, graded ? "镜 · 上中下三策" : "镜 · 三次相似的处境"));
+    var hint = (data && data.local)
+      ? "离线兜底引擎检索所得（精度低于内置界面）" : "本机 C# 引擎检索所得";
+    if (!graded && data && data.verdictDocs === 0) {
+      hint += " · 上中下分级待标注产出，此前按相关度排列";
+    }
+    head.appendChild(el("span", "hint", hint));
     box.appendChild(head);
-    for (var i = 0; i < hits.length; i++) box.appendChild(renderHit(hits[i], i, query));
+    var strip = situationStrip(hits);
+    if (strip) box.appendChild(strip);
+    var grid = el("div", "grid-3");
+    var slots = resultSlots(data);
+    for (var i = 0; i < slots.length; i++) grid.appendChild(renderPlanCol(slots[i], query));
+    box.appendChild(grid);
   }
   function renderExplain(data) {
     var box = $("explain-body");
@@ -322,6 +504,12 @@
     if (!data) return;
     box.appendChild(el("p", null, "规范化：" + (data.normalized || "—")));
     box.appendChild(el("p", null, "词元（C# 生成）：" + ((data.terms && data.terms.length) ? data.terms.join("、") : "—")));
+    var pairs = data.bridge || [];
+    if (pairs.length) {
+      var list = [];
+      for (var i = 0; i < pairs.length; i++) list.push("「" + pairs[i].said + "」→ " + pairs[i].label);
+      box.appendChild(el("p", null, "系统把你的话理解成了：" + list.join("、")));
+    }
   }
 
   // ---------- 检索 ----------
@@ -561,18 +749,65 @@
     });
   }
 
+  // 宿主是在后台线程里备书的，页面会比它早**约两秒**起来（实测：01:19:51 导航到页面，
+  // 01:19:53 语料才就绪）。此前这里拿到 docs=0 就当成最终结论，于是：
+  //   · 「稽古一问」永远不放开 —— 只有点示例按钮走完一次 doSearch，才会在收尾处解禁；
+  //   · 藏书阁渲染成「全不勾」—— 同一时刻 _selectedShards 也还没赋值，且之后不会自愈。
+  // 现在 docs=0 只代表「还没备好」，轮询等它，不把中间态当成结果。
+  var engineReady = false, readyTimer = null, readyTries = 0;
+  var libInstalled = false, libBooks = 0;
+
+  function engineWait() {
+    if (engineReady || readyTimer !== null) return;
+    readyTries = 0;
+    readyTimer = later(enginePoll, 400);
+  }
+  function enginePoll() {
+    readyTimer = null;
+    readyTries++;
+    callJsonAuto("GetSnapshot").then(function (s) {
+      if (s && !s.local && (s.docs || 0) > 0) {
+        showSnapshot(s);
+        refreshLibrary();   // 勾选和语料在 RebuildCorpus 里一起赋值，此刻一起就绪
+        return;
+      }
+      // 40 次 × 400ms ≈ 16 秒还备不好就不再等：放开按钮让用户自己试。
+      // 真出问题时 Search 会返回「书库尚未就绪」，比一个永远点不动的按钮诚实。
+      if (readyTries >= 40) {
+        setStatus("书库读取较慢，可以先试着检索。", "warn");
+        enableSearch();
+        return;
+      }
+      readyTimer = later(enginePoll, 400);
+    });
+  }
+
+  // 「装了分册」与「勾了分册」是两件事：一部都没勾时给个明确的去处，
+  // 否则用户只会觉得结果就这几条，根本不知道本地还躺着二十四史。
+  function updateLibraryCta() {
+    var cta = $("lib-cta");
+    if (cta) cta.style.display = (engineReady && libInstalled && libBooks === 0) ? "" : "none";
+  }
+
   function showSnapshot(snap) {
     if (!snap) { setStatus("未能连接本地引擎。", "warn"); return; }
     if (!snap.local) {
-      var t = "已备 " + (snap.docs || 0) + " 则史料";
-      if (snap.books > 0) t += " · 已加载 " + snap.books + " 部史书";
-      else if (snap.libraryInstalled) t += " · 未加载史书分册";
+      var n = snap.docs || 0;
+      libInstalled = !!snap.libraryInstalled;
+      libBooks = snap.books || 0;
+      if (n <= 0) { setStatus("正在备书…"); engineWait(); return; }
+      engineReady = true;
+      var t = "已备 " + n + " 则史料";
+      if (libBooks > 0) t += " · 已加载 " + libBooks + " 部史书";
+      else if (libInstalled) t += " · 未加载史书分册";
       t += " · v" + (snap.version || "");
-      setStatus(t, (snap.docs || 0) > 0 ? "ready" : "warn");
-      if ((snap.docs || 0) > 0) enableSearch();
+      setStatus(t, "ready");
+      enableSearch();
+      updateLibraryCta();
       return;
     }
     if ((snap.docs || 0) > 0) {
+      engineReady = true;
       setStatus("离线模式 · 已备 " + snap.docs + " 则史料（精度低于内置界面）", "ready");
       enableSearch();
     } else {
@@ -584,6 +819,13 @@
     return Promise.all([callJsonAuto("CorpusStats"), callJsonAuto("GetSnapshot"),
       callJsonAuto("GetLibrary")])
       .then(function (r) {
+        // 勾选数量以这里读到的为准：改完勾选、数据热更新、等语料就绪都会走这条路，
+        // 不在这儿同步的话右侧那个「去藏书阁选书」会一直挂着不消失。
+        if (r[1]) {
+          if (r[1].libraryInstalled !== undefined) libInstalled = !!r[1].libraryInstalled;
+          if (r[1].books !== undefined) libBooks = r[1].books || 0;
+          updateLibraryCta();
+        }
         renderLibrary(r[0], r[1]);
         renderShards(r[2]);
       });
@@ -669,6 +911,18 @@
     "新产品上线后被用户集中投诉，口碑下滑，销售还催我加大投入"
   ];
 
+  // 首次运行引导只弹一次。localStorage 不可用（少数受限承载环境）时当作「已看过」——
+  // 每次启动都弹一遍比不弹更烦人。
+  var GUIDE_KEY = "jigu.guide.library.v1";
+  function guideSeen() {
+    try { return window.localStorage.getItem(GUIDE_KEY) === "1"; } catch (e) { return true; }
+  }
+  function markGuide() {
+    try { window.localStorage.setItem(GUIDE_KEY, "1"); } catch (e) { }
+    var g = $("guide");
+    if (g) g.style.display = "none";
+  }
+
   function showTab(name) {
     var s = $("view-search"), l = $("view-library");
     if (s) s.style.display = name === "search" ? "block" : "none";
@@ -698,11 +952,22 @@
     var ta = $("situation");
     if (ta) {
       ta.onkeydown = function (e) {
-        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); doSearch(); }
+        // 输入法组字阶段（拼音候选未上屏）的回车是「选字」，不是「提交」。
+        // 中文输入法下这条判断不能省：少了它，拼音打一半按回车会把半截拼音送去检索。
+        if (e.isComposing || e.keyCode === 229) return;
+        if (e.key !== "Enter" || e.altKey) return;
+        if (e.shiftKey) return;          // Shift + Enter 留给换行
+        e.preventDefault();              // 裸 Enter 与 Ctrl / ⌘ + Enter 都发起检索
+        doSearch();
       };
     }
     bind("tab-search", function () { showTab("search"); });
     bind("tab-library", function () { showTab("library"); });
+    bind("lib-cta", function () { showTab("library"); });
+    bind("guide-go", function () { markGuide(); showTab("library"); });
+    bind("guide-close", markGuide);
+    var guide = $("guide");
+    if (guide && !guideSeen()) guide.style.display = "block";
     bind("check-data", checkData);
     bind("apply-data", applyData);
     bind("check-app", checkApp);
@@ -724,6 +989,9 @@
 
     later(function poll() {
       if (!host()) { later(poll, 60000); return; }
+      // 上一轮等了 16 秒仍没备好（enginePoll 放手的那个分支）：这一轮再补问一次，
+      // 不然界面会一直停在「读得慢」的状态，用户没法自己恢复。
+      if (!engineReady) callJsonAuto("GetSnapshot").then(showSnapshot);
       call("ConsumeDataUpdated").then(function (v) {
         if (v === true) {
           // 热替换会按当前勾选重建语料，状态条的条数/部数都得跟着变

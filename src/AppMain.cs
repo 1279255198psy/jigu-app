@@ -4,6 +4,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Windows.Forms;
@@ -360,6 +361,15 @@ namespace Jigu
                 if (books.Count == 0)
                 {
                     sb.AppendLine("分片清单 : 无（本次安装未带 corpus\\index.json，只跑精选集）");
+                    // 没装分片时也要报精选集的覆盖 —— 这一行是标注放量的验收指标，
+                    // 只在装了分片的机器上才有的话，验收的人会以为「没有这个功能」。
+                    int selOnly, selOnlyCast, selOnlyThemes;
+                    corpus.AnnotationStats(out selOnly, out selOnlyCast, out selOnlyThemes);
+                    sb.AppendLine("标注覆盖 : 精选集 " + Pct(selOnly, corpus.DocCount) + "（"
+                        + selOnly + "/" + corpus.DocCount + "）· 核心人物 "
+                        + Pct(selOnlyCast, corpus.DocCount) + " · 情境标签 "
+                        + Pct(selOnlyThemes, corpus.DocCount));
+                    AppendVerdictStats(sb, "分级覆盖 : 精选集 ", corpus);
                 }
                 else
                 {
@@ -374,6 +384,22 @@ namespace Jigu
                     lib.LoadFrom(shardBase, Library.ShardPaths(shardBase, sel));
                     sb.AppendLine("载入结果 : " + lib.DocCount + " 条 / " + lib.TermCount + " 词 / 索引 "
                         + (lib.IndexBytes / 1048576) + " MB");
+                    // 标注覆盖率是阶段 2 逐级放量的主要验收指标：没有它，「标到哪了」
+                    // 只能靠翻界面翻出来。分片与精选分开报，因为两者的分母完全不同 ——
+                    // 混在一起会把 201 条精选的 100% 稀释成看起来还行的样子。
+                    int annTotal, annCast, annThemes;
+                    lib.AnnotationStats(out annTotal, out annCast, out annThemes);
+                    sb.AppendLine("标注覆盖 : " + Pct(annTotal, lib.DocCount) + " 有标注（"
+                        + annTotal + "/" + lib.DocCount + "）· 核心人物 " + Pct(annCast, lib.DocCount)
+                        + " · 情境标签 " + Pct(annThemes, lib.DocCount));
+                    int selTotal, selCast, selThemes;
+                    corpus.AnnotationStats(out selTotal, out selCast, out selThemes);
+                    sb.AppendLine("           精选集 " + Pct(selTotal, corpus.DocCount) + "（"
+                        + selTotal + "/" + corpus.DocCount + "）—— 分片这一档才是待办量");
+                    // 分级覆盖和标注覆盖一样，是逐级放量的验收指标：上中下要等标注
+                    // 跑起来才有，这一行现在必然全是 0 —— 那正是本轮功能惰性的证据。
+                    AppendVerdictStats(sb, "分级覆盖 : ", lib);
+                    AppendVerdictStats(sb, "           精选集 ", corpus);
                     if (lib.DocCount < corpus.DocCount)
                     {
                         fails++;
@@ -450,6 +476,7 @@ namespace Jigu
 
             sb.AppendLine("--- 3b. 排序比对（只精选 vs 精选 + 已勾选分册）---");
             int identical = 0, keptAll = 0, lostSome = 0, cases2 = 0, shardHits = 0, totalHits = 0;
+            int gradedCases = 0, gradedHits = 0, gradedShard = 0;
             foreach (object item in cases)
             {
                 IDictionary c = item as IDictionary;
@@ -480,6 +507,22 @@ namespace Jigu
                     string bk = b[i].Doc.Book;
                     // 精选集的 book 是朝代桶（先秦秦汉/三国两晋/…），分册的 book 直接是史书名
                     if (!string.IsNullOrEmpty(bk) && !IsDynastyBucket(bk)) shardHits++;
+                }
+                // 分级路径的对照。语料里没有档位时 SearchByVerdict 就是 SearchScored，
+                // 下面这段整体不生效 —— 报出来正是为了让「惰性」可见，而不是靠嘴说。
+                // 等标注产出档位，这一行会变成「各档最终选了谁」，那时要盯的是
+                // 精选条目还能不能进档（分片多、IDF 被稀释，与上面同一套毛病）。
+                bool graded;
+                List<Corpus.SearchHit> g = loaded.SearchByVerdict(query, 3, out graded);
+                if (graded)
+                {
+                    gradedCases++;
+                    for (i = 0; i < g.Count; i++)
+                    {
+                        gradedHits++;
+                        string gk = g[i].Doc.Book;
+                        if (!string.IsNullOrEmpty(gk) && !IsDynastyBucket(gk)) gradedShard++;
+                    }
                 }
                 bool same = (ta.Length > 0 && kept == ta.Length && kept == tb.Length);
                 if (same) identical++;
@@ -516,6 +559,11 @@ namespace Jigu
             sb.AppendLine("  占比对照 : 精选 " + curDocs + " 条占全量 " + allDocs + " 条的 "
                 + (allDocs == 0 ? 0 : curDocs * 100 / allDocs) + "%，"
                 + "却占 Top3 的 " + (totalHits == 0 ? 0 : (totalHits - shardHits) * 100 / totalHits) + "%");
+            sb.AppendLine("  分级路径 : " + (gradedCases == 0
+                ? "本机语料一条档位都没有，上中下分档整体不生效（SearchByVerdict 与按分排序逐条相同）"
+                : gradedCases + "/" + cases2 + " 条用例走了分档；选中 " + gradedHits
+                    + " 条，其中来自史书分册 " + gradedShard + " 条"));
+
             sb.AppendLine("  说明     : 差异不是缺陷。IDF 按当前已加载的文档计算，多加载几部书，"
                 + "词元权重随之改变，Top3 就会变 —— 这是「按需加载」的固有性质。"
                 + "要看的是「原有三条被挤出几条」。");
@@ -523,6 +571,26 @@ namespace Jigu
 
         private static string[] DynastyBuckets = new string[]
         { "种子", "先秦秦汉", "三国两晋", "隋唐五代", "两宋", "明", "清" };
+
+        /// <summary>
+        /// 上/中/下分级的覆盖率。和标注覆盖分开报：分级要等标注流水线产出，进度独立，
+        /// 混在一起看不出「标注在走、分级还没开始」这个中间态。
+        /// 全 0 是当前的**正常状态**（分级尚未产出），不是故障 —— 检索侧对它完全惰性。
+        /// </summary>
+        private static void AppendVerdictStats(StringBuilder sb, string prefix, Corpus c)
+        {
+            int total, up, mid, down;
+            c.VerdictStats(out total, out up, out mid, out down);
+            sb.AppendLine(prefix + Pct(total, c.DocCount) + "（" + total + "/" + c.DocCount
+                + "）· 上 " + up + " / 中 " + mid + " / 下 " + down);
+        }
+
+        /// <summary>标注覆盖率用的百分比。分母为 0 时给「—」而不是除零或 0%，后者会被读成「一条都没有」</summary>
+        private static string Pct(int n, int total)
+        {
+            if (total <= 0) return "—";
+            return ((n * 100.0) / total).ToString("F1", CultureInfo.InvariantCulture) + "%";
+        }
 
         private static bool IsDynastyBucket(string book)
         {

@@ -35,6 +35,22 @@ namespace Jigu
         public string[] Pros = new string[0];
         /// <summary>这条史料的决策「弊」</summary>
         public string[] Cons = new string[0];
+        /// <summary>登场人物及其身份角色，形如「项羽（西楚霸王·主帅）」。为空时界面回落 Figures</summary>
+        public string[] Cast = new string[0];
+        /// <summary>决策的起因</summary>
+        public string Cause = "";
+        /// <summary>决策的经过</summary>
+        public string Process = "";
+        /// <summary>对当下现实困境的指导意义</summary>
+        public string Significance = "";
+        /// <summary>
+        /// 构建期判定的分级：上 / 中 / 下。判的是**当事人对那次困境处理得好不好**
+        /// （是否达成目的、代价是否可控），不是史事本身重不重要。
+        /// 空串是合法值，表示「这条没档位」—— 绝不能拿它去凑「下策」。
+        /// </summary>
+        public string Verdict = "";
+        /// <summary>为什么判成这一档，一句话。运行时只呈现，不参与打分。</summary>
+        public string VerdictWhy = "";
     }
 
     /// <summary>语料库：加载、索引、检索</summary>
@@ -57,6 +73,45 @@ namespace Jigu
         /// <summary>由标签桥加进来的词的折扣（可调）。只扣一次，不叠加。</summary>
         private const double LabelDiscount = 0.75;
 
+        /// <summary>
+        /// trigger 在语料里的文档频次超过这个数就失去触发资格（可调）。
+        /// LabelTable 与查询侧的泛词门槛共用同一个值，别让两处阈值漂移。
+        /// </summary>
+        internal const int HighDf = 15;
+
+        /// <summary>
+        /// 分词时「一个单字」的额外代价（可调）。单字几乎不会是用户想检索的词，
+        /// 它在这里唯一的作用是让每个块都有解 —— 一个切不动的字不该让整块被丢弃，
+        /// 那会连带丢掉块里真正的词。代价必须大到「两个单字」永远比不过「一个双字词」。
+        /// </summary>
+        private const double SingleCharPenalty = 4.0;
+
+        /// <summary>
+        /// 分级选取的候选池大小（可调）。池要大，才能找到「本来排名很靠后」的
+        /// 那一档的最佳代表；取 3 就退化成「Top3 里凑档位」，等于没改。
+        /// 200 这个量级 RunRankDiff 已在生产路径上跑过，成本可接受。
+        /// </summary>
+        private const int GradedPool = 200;
+
+        /// <summary>
+        /// 相关性下限（可调）：候选的有效分须达到池内最高分的这个比例，才允许进档位。
+        /// 用相对值而非绝对值 —— idf = ln((n+1)/(df+1))+1 随已加载文档数漂移
+        /// （201 条精选 vs 7.8 万条分片，同一个词的 idf 能差一倍），绝对阈值必然失准。
+        /// 0.35 是保守起点；定死它需要评测集，见 docs 里的评测说明。
+        /// </summary>
+        private const double VerdictFloorRatio = 0.35;
+
+        /// <summary>档位的固定展示顺序：上策在最前。按档排，不按分排。</summary>
+        private static readonly string[] TierOrder = new string[] { "上", "中", "下" };
+
+        /// <summary>
+        /// 语料里是否至少有一条带分级。在 IndexDoc 内累积 —— 三处调用都在
+        /// lock(_gate) 内，符合现有「写只在加载期」的约定。为 false 时检索整体
+        /// 走旧路径，这是「标注还没跑起来之前完全惰性」的开关。
+        /// 不要改成「首次检索时惰性计算」：那会从 ClassicForm 的线程池线程写字段。
+        /// </summary>
+        private bool _hasVerdicts;
+
         private readonly List<CorpusDoc> _docs = new List<CorpusDoc>();
         private readonly Dictionary<string, List<int>> _index =
             new Dictionary<string, List<int>>(StringComparer.Ordinal);
@@ -68,6 +123,24 @@ namespace Jigu
         public int DocCount { get { return _docs.Count; } }
         public int TermCount { get { return _index.Count; } }
         public int LabelCount { get { return _labels == null ? 0 : _labels.LabelCount; } }
+
+        /// <summary>
+        /// 标注覆盖率体检。判据是「有任一标注字段」而不是「四个字段齐全」——
+        /// 分片是分批标注的，一批可能只补了 themes，用全齐当门槛会把进度报成 0。
+        /// themes 与 cast/cause/process/significance 任一非空即算已标注。
+        /// </summary>
+        public void AnnotationStats(out int annotated, out int withCast, out int withThemes)
+        {
+            annotated = 0; withCast = 0; withThemes = 0;
+            foreach (CorpusDoc d in _docs)
+            {
+                if (d.Cast.Length > 0) withCast++;
+                if (d.Themes.Length > 0) withThemes++;
+                if (d.Cast.Length > 0 || d.Themes.Length > 0
+                    || d.Cause.Length > 0 || d.Process.Length > 0 || d.Significance.Length > 0)
+                    annotated++;
+            }
+        }
 
         /// <summary>标签表体检：trigger 总数 / 其中在语料里存在的个数</summary>
         public void LabelStats(out int triggers, out int inCorpus)
@@ -232,8 +305,18 @@ namespace Jigu
             AddTerms(seen, doc.Translation);
             AddTerms(seen, doc.Decision);
             AddTerms(seen, doc.Outcome);
+            // 标注字段一并进索引。同义词桥（LabelTable.Expand）只认「索引里已存在的
+            // 词」，所以标注不提词就白标 —— 分片此前对同义词桥完全隐形就是这个原因。
+            // 身份角色词（「主帅」「谋臣」「宦官」）本身也是有用的检索信号。
+            AddTerms(seen, doc.Cause);
+            AddTerms(seen, doc.Process);
+            AddTerms(seen, doc.Significance);
+            // VerdictWhy 也进索引，与其它标注字段一视同仁（见上：标注不提词就白标）。
+            // Verdict 本身不进 —— 那是分类不是文本，用户不会拿「上」「中」「下」去搜。
+            AddTerms(seen, doc.VerdictWhy);
             foreach (string f in doc.Figures) AddTerms(seen, f);
             foreach (string t in doc.Themes) AddTerms(seen, t);
+            foreach (string c in doc.Cast) AddTerms(seen, c);
 
             foreach (string term in seen)
             {
@@ -245,6 +328,11 @@ namespace Jigu
                 }
                 list.Add(doc.No);
             }
+
+            // 分级开关：整个语料只要有一条带档位，分级选取就接管。写在 IndexDoc 内
+            // 是因为它只在加载期被调用（三处调用都在 lock(_gate) 内），符合现有
+            // 「写只在加载期」的约定；放到检索路径上去惰性计算会破坏这一点。
+            if (doc.Verdict.Length > 0) _hasVerdicts = true;
         }
 
         /// <summary>把一段文字切成 2~4 字词元（含 2 字滑窗，覆盖最常见的中文词组）</summary>
@@ -303,11 +391,23 @@ namespace Jigu
             return result;
         }
 
+        /// <summary>一条命中理由：用户说的原话，与它被系统理解成的标签名。</summary>
+        internal sealed class WhyPair
+        {
+            public string Said = "";
+            public string Label = "";
+        }
+
         internal sealed class SearchHit
         {
             public CorpusDoc Doc;
             public double Score;
             public List<string> Terms = new List<string>();
+            /// <summary>
+            /// 这条命中携带的理由子集：只有**真正桥到这条文档**的标签才算它的理由，
+            /// 不是把整句命中的标签一股脑挂上去。空表示「这条不是靠同义词桥命中的」。
+            /// </summary>
+            public List<WhyPair> Why = new List<WhyPair>();
         }
 
         internal List<SearchHit> SearchScored(string query, int topK)
@@ -322,19 +422,39 @@ namespace Jigu
 
             // 情境标签桥：把用户语言映射到史料挂着的标签名（详见 LabelTable 的注释）。
             // 标签名打 0.75 折，避免它们压过查询里本来就说对了的原词。
-            HashSet<string> syn = _labels == null ? null : _labels.Expand(norm, _index);
-            if (syn != null)
+            // 走 ExpandTraced 而不是 Expand：标签集合完全相同，但额外留住
+            // 「是哪句用户原话触发它的」，界面要靠它解释「为什么给你看这条」。
+            Dictionary<string, List<string>> trace =
+                _labels == null ? null : _labels.ExpandTraced(norm, _index);
+            HashSet<string> syn = null;
+            // 用户自己打出来的词元。同义桥的折扣只能扣在**桥进来**的词上：
+            // 若用户打的词恰好与标签名同名（Q4 的「口碑」就是），旧写法只看
+            // 「这个词在不在标签表里」，于是把用户的原话也打了 0.75 折 ——
+            // 恰好压低的是查询里最贴题的那个词。BuildWhy 早就区分了这两种情况
+            // （见那里「同义反复」的注释），打分这里当初漏了。
+            HashSet<string> userSaid = new HashSet<string>(terms, StringComparer.Ordinal);
+            if (trace != null)
             {
-                foreach (string t in syn)
+                syn = new HashSet<string>(trace.Keys, StringComparer.Ordinal);
+                foreach (string t in trace.Keys)
                     if (!terms.Contains(t)) terms.Add(t);
             }
 
             int n = Math.Max(_docs.Count, 1);
+
+            // 这里曾经有一道「2 字泛词门槛」（词元长度 < 3 且 df 超过全库 2% 就丢弃）。
+            // 它已被删除，因为它从来没有生效过：实测把它加上去之后，自检输出与改动前
+            // 逐字节相同。原因是它瞄错了人群 —— 污染词元的 df 不是「太高」而是「极低」
+            // （新产/大投/我加 的 df 都是 1，正因罕见，idf 才高得离谱）。
+            // 真正的成因在 Tokenize：见那里对 Viterbi 分词的说明。
+            List<string> used = new List<string>(terms.Count);
+            foreach (string term in terms)
+                if (_index.ContainsKey(term)) used.Add(term);
             Dictionary<int, double> score = new Dictionary<int, double>();
             Dictionary<int, double> best = new Dictionary<int, double>();
             Dictionary<int, List<string>> matched = new Dictionary<int, List<string>>();
 
-            foreach (string term in terms)
+            foreach (string term in used)
             {
                 List<int> list;
                 if (!_index.TryGetValue(term, out list)) continue;
@@ -343,7 +463,7 @@ namespace Jigu
                 // 折扣只扣一次：只对「由标签桥加进来的词」打 0.75 折（用户自己打出来的词不扣）。
                 // 曾经这里还叠了一层「标签名再打 0.6 折」，结果同一个词被扣成 0.45，
                 // 查询里最贴题的词（如「管理失控」）反而不如一个偶发的生僻词值钱 —— 实测到才发现的。
-                bool fromSyn = syn != null && syn.Contains(term);
+                bool fromSyn = syn != null && syn.Contains(term) && !userSaid.Contains(term);
                 if (fromSyn) w *= LabelDiscount;
                 string shown = fromSyn ? term + "（同义）" : term;
                 for (int i = 0; i < list.Count; i++)
@@ -385,39 +505,12 @@ namespace Jigu
                 return a.Key.CompareTo(b.Key);
             });
 
-            // 产品承诺「永远给三条」：主词元命中不足三条时，用 2 字滑窗补足差额。
-            // 只在缺位时才补，且不打扰已经排好的结果（已命中的文档一律跳过）；
-            // 补进来的分数按 0.5 权重算，天然排在后面。
-            if (ranked.Count < topK)
-            {
-                Dictionary<int, double> filler = new Dictionary<int, double>();
-                foreach (string term in Bigrams(norm))
-                {
-                    if (terms.Contains(term)) continue;
-                    List<int> list;
-                    if (!_index.TryGetValue(term, out list)) continue;
-                    double idf = Math.Log((n + 1.0) / (list.Count + 1.0)) + 1.0;
-                    double w = idf * 0.5;
-                    for (int i = 0; i < list.Count; i++)
-                    {
-                        int d = list[i];
-                        if (score.ContainsKey(d)) continue;
-                        double cur;
-                        filler.TryGetValue(d, out cur);
-                        filler[d] = cur + w;
-                        List<string> mt;
-                        if (!matched.TryGetValue(d, out mt)) { mt = new List<string>(4); matched[d] = mt; }
-                        if (!mt.Contains(term)) mt.Add(term);
-                    }
-                }
-                List<KeyValuePair<int, double>> more = new List<KeyValuePair<int, double>>(filler);
-                more.Sort(delegate(KeyValuePair<int, double> a, KeyValuePair<int, double> b)
-                {
-                    int c2 = b.Value.CompareTo(a.Value);
-                    return c2 != 0 ? c2 : a.Key.CompareTo(b.Key);
-                });
-                ranked.AddRange(more);
-            }
+            // 这里曾经有一段「主词元命中不足三条时用 2 字滑窗补足差额」的逻辑，
+            // 理由是「产品承诺永远给三条」。那段已经删掉，因为承诺本身被推翻了：
+            // 凑出来的第三条与用户的问题无关，比诚实地只给两条更糟 ——
+            // 本项目自己的自检（AppMain.RunSearchCases）就是这么写的，CHANGELOG 0.1.0
+            // 也向用户承诺过「不拿无关条目凑数」。缺的那条由界面渲染成空档说明。
+            // 删掉之后有个副作用是好的：每条结果都是真命中，不再需要「补足项」标记。
 
             int take = Math.Min(topK, ranked.Count);
             for (int i = 0; i < take; i++)
@@ -427,9 +520,162 @@ namespace Jigu
                 h.Score = ranked[i].Value;
                 List<string> mt;
                 if (matched.TryGetValue(ranked[i].Key, out mt)) h.Terms = mt;
+                h.Why = BuildWhy(h.Terms, trace, syn);
                 result.Add(h);
             }
             return result;
+        }
+
+        /// <summary>
+        /// 从这条命中的词元里挑出「为什么给你看这条」：某个词元是标签名，就说明
+        /// 这条史料是靠挂在它身上的情境标签被找到的。
+        ///
+        /// 判据是 **syn（标签名集合）**，不是「（同义）」后缀 —— 后缀只标「打了折的
+        /// 桥接词」，那是个打分概念。用后缀当出处会漏掉一种真实情况：用户打的是
+        /// 「不会用人」，分词把它切成了词元「用人」，而「用人」正好是标签名 ——
+        /// 它进了 terms 却没有后缀（用户自己说的话不打折），于是这条最该被解释的
+        /// 命中反而给不出理由。实测 TierCheck 的理由链路一节就是这样红的。
+        /// </summary>
+        private static List<WhyPair> BuildWhy(
+            List<string> terms, Dictionary<string, List<string>> trace, HashSet<string> labels)
+        {
+            List<WhyPair> why = new List<WhyPair>();
+            if (trace == null || terms == null || labels == null) return why;
+            const string Suffix = "（同义）";
+            foreach (string shown in terms)
+            {
+                string label = shown.EndsWith(Suffix, StringComparison.Ordinal)
+                    ? shown.Substring(0, shown.Length - Suffix.Length) : shown;
+                if (!labels.Contains(label)) continue;
+                List<string> said;
+                if (!trace.TryGetValue(label, out said)) continue;
+                foreach (string s in said)
+                {
+                    // 用户直接打出了标签名，那不是「桥」出来的理解，是同义反复
+                    if (string.Equals(s, label, StringComparison.Ordinal)) continue;
+                    WhyPair p = new WhyPair();
+                    p.Said = s;
+                    p.Label = label;
+                    why.Add(p);
+                    if (why.Count >= 4) return why;   // 上限，避免界面爆行
+                }
+            }
+            return why;
+        }
+
+        /// <summary>
+        /// 上/中/下分级选取：每档取最高分的那条，而不是笼统取分数前三。
+        /// 这是 SearchScored 之上的一层包装，不改 SearchScored 本身 ——
+        /// 后者是「按分数排序」的评分对照路径，被自检的排序比对、AnnoCheck
+        /// 和内置兜底界面共用，动它会同时改掉四处行为。
+        ///
+        /// graded 为 false 表示「走了旧路径」，此时返回的与直接调 SearchScored 一致。
+        /// 语料里一条分级都没有时**必然**为 false —— 这是本功能在标注跑起来之前
+        /// 完全惰性的保证。
+        /// </summary>
+        internal List<SearchHit> SearchByVerdict(string query, int topK, out bool graded)
+        {
+            graded = false;
+            if (!_hasVerdicts) return SearchScored(query, topK);
+
+            // 池必须开得比 topK 大：某一档的最佳代表本来可能排在第 40 名，
+            // 只取前三就等于「在 Top3 里凑档位」，那和没改一样。
+            List<SearchHit> pool = SearchScored(query, GradedPool);
+            double top = 0;
+            foreach (SearchHit h in pool) if (h.Score > top) top = h.Score;
+            if (top <= 0) return SearchScored(query, topK);
+
+            double floor = top * VerdictFloorRatio;
+            Dictionary<string, SearchHit> byTier =
+                new Dictionary<string, SearchHit>(StringComparer.Ordinal);
+            foreach (SearchHit h in pool)          // pool 已按有效分降序
+            {
+                if (h.Score < floor) break;        // 后面只会更小，可以停
+                string v = h.Doc == null ? "" : h.Doc.Verdict;
+                // 没档位的条目不能占档位；同档只留第一条（即最高分那条）
+                if (v.Length == 0 || byTier.ContainsKey(v)) continue;
+                byTier[v] = h;
+            }
+            // 一档都没选出来就退回旧路径 —— 宁可给不出三策，也不能返回空。
+            if (byTier.Count == 0) return SearchScored(query, topK);
+
+            graded = true;
+            List<SearchHit> picked = new List<SearchHit>(3);
+            foreach (string tier in TierOrder)
+            {
+                SearchHit h;
+                // 缺档就少一条，不拿无关条目顶替（界面会渲染成空档说明）
+                if (byTier.TryGetValue(tier, out h)) picked.Add(h);
+            }
+            return picked;
+        }
+
+        /// <summary>
+        /// 同义词桥的全貌，形如 [{"said":"各自为政","label":"内部矛盾"}]，供
+        /// 「观其解字之法」面板使用。放在 Corpus 上而不是让调用方去够 _labels/_index，
+        /// 是为了让这两个字段维持私有 —— 它们只在加载期被写。
+        /// </summary>
+        public string BridgeToJson(string norm)
+        {
+            StringBuilder sb = new StringBuilder("[");
+            Dictionary<string, List<string>> trace =
+                _labels == null ? null : _labels.ExpandTraced(norm, _index);
+            if (trace != null)
+            {
+                bool first = true;
+                foreach (KeyValuePair<string, List<string>> kv in trace)
+                {
+                    foreach (string said in kv.Value)
+                    {
+                        // 用户直接打出了标签名，那不是桥出来的理解，是同义反复
+                        if (string.Equals(said, kv.Key, StringComparison.Ordinal)) continue;
+                        if (!first) sb.Append(',');
+                        first = false;
+                        sb.Append("{\"said\":\"").Append(Json.Escape(said))
+                          .Append("\",\"label\":\"").Append(Json.Escape(kv.Key)).Append("\"}");
+                    }
+                }
+            }
+            sb.Append(']');
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 分级覆盖率体检。刻意不并进 AnnotationStats —— 那个的判据「有没有任一
+        /// 标注字段」已经在 AnnoCheck 里被钉了期望值（ann==2），把分级折进去会
+        /// 让那几条断言凭空变红。分级是后加的、进度也独立，分开报更清楚。
+        /// </summary>
+        public void VerdictStats(out int withVerdict, out int up, out int mid, out int down)
+        {
+            withVerdict = 0; up = 0; mid = 0; down = 0;
+            foreach (CorpusDoc d in _docs)
+            {
+                if (d.Verdict.Length == 0) continue;
+                withVerdict++;
+                if (d.Verdict == "上") up++;
+                else if (d.Verdict == "中") mid++;
+                else if (d.Verdict == "下") down++;
+            }
+        }
+
+        /// <summary>
+        /// 分级取值归一：只认字面的 上 / 中 / 下，其余（「上策」「上等」「优」「"上 "」）
+        /// 一律归空串，即「没标注」。
+        /// 为什么宁可丢掉也不猜：档位是拿去做三策分栏的键，一个归不进来的取值会造出
+        /// 一个永远排不进 TierOrder 的幽灵档位 —— 那条史料就再也进不了任何一栏。
+        /// 归空则是安全的：它退回未分级池，与没标注的条目行为完全相同。
+        /// </summary>
+        public static string NormalizeVerdict(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            string s = raw.Trim();
+            // 白名单而不是「取首字」：后者会把「下面」「中学」这类词误判成档位。
+            // 只多认一个「上策」写法 —— 标注提示词里要求的是「上/中/下」，
+            // 但模型偶尔会带上「策」字，这属于可预期的漂移，顺手容错。
+            if (s == "上" || s == "上策") return "上";
+            if (s == "中" || s == "中策") return "中";
+            if (s == "下" || s == "下策") return "下";
+            return "";
         }
 
         /// <summary>输入规范化：全角转半角、标点与空白归一</summary>
@@ -449,13 +695,25 @@ namespace Jigu
         }
 
         /// <summary>
-        /// 查询分词：从左到右取「词表里存在的最长词元」。
+        /// 查询分词：对每个块做一元语言模型 + Viterbi，取整块代价最小的切法。
         ///
-        /// 命中不了时只前进 1 字、**不吐词元**。旧版在这里无条件吐一个 2 字窗口并前进 2，
-        /// 而那个 2 字窗口根本不查词表，于是凭空造出词表里并不存在的词元，并把真词切碎：
-        /// 例如「我和合伙人互相猜忌」会在「相」处吐出 `相猜`、跳过相邻的「忌」，导致
-        /// `猜忌`（语料里 5 条，含 陈平反间，范增去楚 / 沙丘之变）永远进不了词元表 ——
-        /// 正确答案就在库里，却从未被检索。
+        /// 词表就是索引自己的词表（2~4 字），一个词的代价是 -log(df/N) —— 越常见的词
+        /// 越便宜。这替换掉了原来的「从左到右取词表里存在的最长词元」。
+        ///
+        /// 换掉的原因：最长匹配只看「这个词表里有没有」，而索引对每个块发的是**全部**
+        /// 2~4 字滑窗（见 EmitBlock），于是跨词边界的巧合碎片常常比真词长，被优先选中，
+        /// 真词反被切碎。实测到的后果是「关联太小」的主要来源：
+        ///   · `管理失控` 被切成 `现在管 | 理失控`；
+        ///   · `新产品上线后被用户集中投诉` 被切成 `新产 | 后被 | 用户 | 集中`；
+        ///   · `骨干员工要离职` 被切成 `骨干 | 员工 | 要离`。
+        /// 这些碎片（新产 / 大投 / 我加 …）df 都只有 1~2，正因为罕见，idf 高得离谱 ——
+        /// 每个碎片都把一条与问题毫无关系的史料单独顶上榜首（实测 Q4：平津侯主父列传 /
+        /// 范雎蔡泽列传 / 任城陈萧王传 三条并列 9.24，靠的只是各自撞上一个 df=1 的碎片）。
+        /// Viterbi 会拿常见词去覆盖这些位置，上例分别切回 `现在 / 管理失控`、
+        /// `产品 / 加大 / 投入`、`骨干 / 员工 / 离职`。
+        ///
+        /// 单字也能作为一步（见 SingleCharPenalty），它保证每个块都有解，
+        /// 但代价高到两个单字永远比不过一个双字词 —— 单字只是退路，不会被当成词元吐出来。
         ///
         /// 若整句一个词元都切不出来（如「合伙人翻脸了」），回落到 2 字滑窗：
         /// 产品承诺是「永远给三条」，空结果不可接受。
@@ -466,21 +724,8 @@ namespace Jigu
             foreach (string block in norm.Split(' '))
             {
                 if (block.Length < 2) continue;
-                int i = 0;
-                while (i < block.Length)
-                {
-                    int picked = 0;
-                    int maxLen = Math.Min(4, block.Length - i);
-                    for (int len = maxLen; len >= 2; len--)
-                    {
-                        string cand = block.Substring(i, len);
-                        if (_index.ContainsKey(cand)) { picked = len; break; }
-                    }
-                    if (picked == 0) { i++; continue; }
-                    string t = block.Substring(i, picked);
+                foreach (string t in Segment(block))
                     if (!outTerms.Contains(t)) outTerms.Add(t);
-                    i += picked;
-                }
             }
 
             // 丢弃查询侧的现代虚词（见 StopWords 的注释：它们 idf 高但无信息，会压过关键词）。
@@ -508,8 +753,51 @@ namespace Jigu
         }
 
         /// <summary>
-        /// 2 字滑窗。两处用到：词元一个都切不出来时的召回兜底，
-        /// 以及主词元命中不足三条时补足差额。
+        /// 把一个块切成 2~4 字的词元（单字只用作退路，不吐出来）。
+        /// 动态规划：best[i] = 覆盖前 i 个字的最小代价，代价见 Tokenize 的说明。
+        /// 词表里没有的候选直接跳过（代价无穷），所以走不通的切法自然不会被选中。
+        /// </summary>
+        private List<string> Segment(string block)
+        {
+            List<string> words = new List<string>();
+            int len = block.Length;
+            double n = Math.Max(_docs.Count, 1) + 2.0;
+            // 单字按「最罕见」定价：它只是让路径存在，不是一个候选词。
+            double single = -Math.Log(2.0 / n) + SingleCharPenalty;
+
+            double[] best = new double[len + 1];
+            int[] from = new int[len + 1];
+            for (int i = 1; i <= len; i++) best[i] = double.MaxValue;
+
+            for (int i = 1; i <= len; i++)
+            {
+                double v = best[i - 1] + single;          // 单字退路，永远可行
+                int back = i - 1;
+                int maxLen = Math.Min(4, i);
+                for (int k = 2; k <= maxLen; k++)
+                {
+                    string cand = block.Substring(i - k, k);
+                    List<int> posting;
+                    if (!_index.TryGetValue(cand, out posting)) continue;
+                    double c = best[i - k] - Math.Log((posting.Count + 1.0) / n);
+                    if (c < v) { v = c; back = i - k; }
+                }
+                best[i] = v;
+                from[i] = back;
+            }
+
+            for (int i = len; i > 0; i = from[i])
+            {
+                int w = i - from[i];
+                // 倒退压栈，最后反转即可 —— 这里直接往前插，量小无所谓。
+                if (w >= 2) words.Insert(0, block.Substring(from[i], w));
+            }
+            return words;
+        }
+
+        /// <summary>
+        /// 2 字滑窗。只在一种情况下用到：分词一个词元都切不出来时的召回兜底。
+        /// （它曾经还负责「命中不足三条时补足差额」，那段已删 —— 见 SearchScored 里的说明。）
         /// </summary>
         private static IEnumerable<string> Bigrams(string norm)
         {
@@ -522,7 +810,8 @@ namespace Jigu
         public string SearchToJson(string query, int topK, out string termsJson, out long elapsedMs)
         {
             System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
-            List<SearchHit> hits = SearchScored(query, topK);
+            bool graded;
+            List<SearchHit> hits = SearchByVerdict(query, topK, out graded);
             sw.Stop();
             elapsedMs = sw.ElapsedMilliseconds;
 
@@ -538,7 +827,29 @@ namespace Jigu
 
             StringBuilder sb = new StringBuilder(4096);
             sb.Append("{\"query\":\"").Append(Json.Escape(query)).Append("\",\"tookMs\":")
-              .Append(elapsedMs).Append(",\"hits\":[");
+              .Append(elapsedMs);
+            // graded 是前端分流的开关：true 走三策三栏，false 走旧的按分列表。
+            // 两者在界面上是同一条渲染路径，差别只在徽章文字与是否出现空档。
+            sb.Append(",\"graded\":").Append(graded ? "true" : "false");
+            // 已加载语料里有多少条带档位。界面据此如实说明「分级待标注」，
+            // 而不是假装软件没有这个功能。0 就是当前的真实状态。
+            int withVerdict, cUp, cMid, cDown;
+            VerdictStats(out withVerdict, out cUp, out cMid, out cDown);
+            sb.Append(",\"verdictDocs\":").Append(withVerdict);
+            if (graded)
+            {
+                sb.Append(",\"tiers\":[");
+                for (int t = 0; t < TierOrder.Length; t++)
+                {
+                    if (t > 0) sb.Append(',');
+                    int at = -1;
+                    for (int i = 0; i < hits.Count; i++)
+                        if (hits[i].Doc != null && hits[i].Doc.Verdict == TierOrder[t]) { at = i; break; }
+                    sb.Append("{\"verdict\":\"").Append(TierOrder[t]).Append("\",\"hit\":").Append(at).Append('}');
+                }
+                sb.Append(']');
+            }
+            sb.Append(",\"hits\":[");
             for (int i = 0; i < hits.Count; i++)
             {
                 if (i > 0) sb.Append(',');
@@ -559,6 +870,9 @@ namespace Jigu
             sb.Append(",\"translation\":\"").Append(Json.Escape(d.Translation)).Append('"');
             sb.Append(",\"decision\":\"").Append(Json.Escape(d.Decision)).Append('"');
             sb.Append(",\"outcome\":\"").Append(Json.Escape(d.Outcome)).Append('"');
+            sb.Append(",\"cause\":\"").Append(Json.Escape(d.Cause)).Append('"');
+            sb.Append(",\"process\":\"").Append(Json.Escape(d.Process)).Append('"');
+            sb.Append(",\"significance\":\"").Append(Json.Escape(d.Significance)).Append('"');
             sb.Append(",\"score\":").Append(hit.Score.ToString("F3", CultureInfo.InvariantCulture));
             sb.Append(",\"figures\":[");
             for (int i = 0; i < d.Figures.Length; i++)
@@ -584,11 +898,28 @@ namespace Jigu
                 if (i > 0) sb.Append(',');
                 sb.Append('"').Append(Json.Escape(d.Cons[i])).Append('"');
             }
+            sb.Append("],\"cast\":[");
+            for (int i = 0; i < d.Cast.Length; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append('"').Append(Json.Escape(d.Cast[i])).Append('"');
+            }
             sb.Append("],\"terms\":[");
             for (int i = 0; i < hit.Terms.Count; i++)
             {
                 if (i > 0) sb.Append(',');
                 sb.Append('"').Append(Json.Escape(hit.Terms[i])).Append('"');
+            }
+            // 分级与判据。没档位时 verdict 是空串，前端据此不渲染徽章。
+            sb.Append("],\"verdict\":\"").Append(Json.Escape(d.Verdict)).Append('"');
+            sb.Append(",\"verdictWhy\":\"").Append(Json.Escape(d.VerdictWhy)).Append('"');
+            // 「为什么给你看这条」：用户原话 -> 系统把它理解成的标签。
+            sb.Append(",\"why\":[");
+            for (int i = 0; i < hit.Why.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"said\":\"").Append(Json.Escape(hit.Why[i].Said))
+                  .Append("\",\"label\":\"").Append(Json.Escape(hit.Why[i].Label)).Append("\"}");
             }
             sb.Append("]}");
         }
@@ -741,6 +1072,20 @@ namespace Jigu
             return false;
         }
 
+        /// <summary>
+        /// 全部标签名，按 labels.json 里的顺序。
+        /// 标注工具要拿它当**闭集**喂给模型（只许从这里挑主题词）；放在这里而不是
+        /// 在工具里另抄一份，是为了两者不可能对不上 —— 抄一份就会各自漂移，
+        /// 而漂移的后果是模型给出的词不在索引里，标注静默失效。
+        /// </summary>
+        public List<string> Names()
+        {
+            List<string> r = new List<string>();
+            if (_entries == null) return r;
+            foreach (string[] e in _entries) r.Add(e[0]);
+            return r;
+        }
+
         /// <summary>trigger 总数（体检用）</summary>
         public int TriggerCount
         {
@@ -803,9 +1148,50 @@ namespace Jigu
             return sink;
         }
 
+        /// <summary>
+        /// 与 Expand 合并的是同一套标签集合，但保留「是哪句用户原话触发它的」。
+        /// 这是界面上「为什么给你看这条」的唯一来源 —— 只并标签名的话，
+        /// 那句关键的用户原话在 Expand 返回时就已经丢了。
+        /// 返回：标签名 -> 触发它的用户原话列表（已去重，可能多条）。
+        /// </summary>
+        public Dictionary<string, List<string>> ExpandTraced(
+            string norm, Dictionary<string, List<int>> index)
+        {
+            Dictionary<string, List<string>> sink =
+                new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            if (_entries == null || string.IsNullOrEmpty(norm) || index == null) return sink;
+
+            foreach (string[] e in _entries)
+            {
+                List<string> hits = MatchingTriggers(e, norm, index);
+                if (hits.Count == 0) continue;
+                if (!index.ContainsKey(e[0])) continue;
+                List<string> list;
+                if (!sink.TryGetValue(e[0], out list))
+                {
+                    list = new List<string>(hits.Count);
+                    sink[e[0]] = list;
+                }
+                foreach (string said in hits) if (!list.Contains(said)) list.Add(said);
+            }
+            return sink;
+        }
+
         /// <summary>整句里字面出现任一 trigger（或标签名本身）即触发该标签。</summary>
         private static bool Triggers(string[] e, string norm, Dictionary<string, List<int>> index)
         {
+            return MatchingTriggers(e, norm, index).Count > 0;
+        }
+
+        /// <summary>
+        /// 把 Triggers 的「命中即 true」拆成「命中了哪些 trigger」。护栏逐条照搬：
+        /// 索引 0 是标签名不受限；非标签名须 ≥3 字；已在索引里且 df 过高则不算触发器。
+        /// Expand 与 ExpandTraced 共用这一个实现，避免两套护栏日后漂移。
+        /// </summary>
+        private static List<string> MatchingTriggers(
+            string[] e, string norm, Dictionary<string, List<int>> index)
+        {
+            List<string> hits = new List<string>(2);
             for (int i = 0; i < e.Length; i++)
             {
                 string m = e[i];
@@ -814,15 +1200,12 @@ namespace Jigu
                 {
                     if (m.Length < 3) continue;
                     List<int> posting;
-                    if (index.TryGetValue(m, out posting) && posting.Count > HighDf) continue;
+                    if (index.TryGetValue(m, out posting) && posting.Count > Corpus.HighDf) continue;
                 }
-                if (norm.IndexOf(m, StringComparison.Ordinal) >= 0) return true;
+                if (norm.IndexOf(m, StringComparison.Ordinal) >= 0) hits.Add(m);
             }
-            return false;
+            return hits;
         }
-
-        /// <summary>trigger 在语料里的文档频次超过这个数就不让它当触发器（可调）</summary>
-        private const int HighDf = 15;
 
         /// <summary>
         /// 体检：trigger 总数，以及其中有多少是语料里真实存在的词。
