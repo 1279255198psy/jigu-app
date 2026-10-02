@@ -488,6 +488,10 @@ namespace Jigu
                 if (string.IsNullOrEmpty(query)) continue;
                 cases2++;
 
+                // 这里**故意**用未加覆盖重排的 SearchScored。本节量的是「多加载几部书
+                // 之后，纯 IDF 排名漂移多少」—— 一个关于 IDF 的指标。一旦掺进覆盖重排，
+                // 数字就不再是它自称的那个东西，将来有人拿它判断「分片稀释严不严重」
+                // 会得出错误结论。要看覆盖重排的效果，去第 4 节（那条走的是产品路径）。
                 List<Corpus.SearchHit> a = curated.SearchScored(query, 3);
                 List<Corpus.SearchHit> b = loaded.SearchScored(query, 3);
                 // 被挤掉的精选条目离 Top3 有多远：拉长榜单看它的名次与分数差。
@@ -515,6 +519,9 @@ namespace Jigu
                 // 下面这段整体不生效 —— 报出来正是为了让「惰性」可见，而不是靠嘴说。
                 // 等标注产出档位，这一行会变成「各档最终选了谁」，那时要盯的是
                 // 精选条目还能不能进档（分片多、IDF 被稀释，与上面同一套毛病）。
+                // 这一条走的是产品路径（SearchByVerdict → SearchSituated），
+                // 所以它**会**受覆盖重排影响，与上面那两行不同。这是有意的：
+                // 它问的是「精选条目还能不能进档」，那必须按用户实际走的规则问。
                 bool graded;
                 List<Corpus.SearchHit> g = loaded.SearchByVerdict(query, 3, out graded);
                 if (graded)
@@ -661,7 +668,12 @@ namespace Jigu
                 string termsJson;
                 long ms;
                 corpus.SearchToJson(query, 3, out termsJson, out ms);
-                List<Corpus.SearchHit> hits = corpus.SearchScored(query, 3);
+                // 护栏量的必须是用户实际走的那条路。这是 SearchByVerdict（→ SearchSituated →
+                // 覆盖重排），不是 SearchScored —— 后者是「纯按分排序」的对照路径，
+                // 拿它当召回护栏，等于给一条产品不走的路径放哨：覆盖重排若把某条
+                // 该进 Top3 的史料挤出榜外，这里会照样绿。
+                bool graded;
+                List<Corpus.SearchHit> hits = corpus.SearchByVerdict(query, 3, out graded);
 
                 // 超过三条是 bug（产品只给三条）；少于三条只是警告 —— 已实测确认
                 // 存在这样的查询：例如「骨干员工要离职，留不住人」的全部 2 字词元
@@ -745,7 +757,12 @@ namespace Jigu
             {
                 try
                 {
+                    // 同上：崩在用户走的那条路上才算数。两条都跑 ——
+                    // 边界输入在 SearchSituated 里会先过一次 ConcernsOf，那是新增的
+                    // 入口，不在这条断言里跑它就没人跑。
                     List<Corpus.SearchHit> h = corpus.SearchScored(edge[i], 3);
+                    bool g;
+                    corpus.SearchByVerdict(edge[i], 3, out g);
                     if (h.Count > 3)
                     {
                         fails++;

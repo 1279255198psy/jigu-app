@@ -1721,7 +1721,19 @@ namespace Jigu
                     // 同义词桥的全貌：用户说的哪句话被理解成了哪个情境标签。
                     // 只讲「切成哪些词元」解释不了「为什么这条跟你有关」，
                     // 而这一层恰恰是用户最看不懂、也最需要看懂的地方。
-                    sb.Append("],\"bridge\":").Append(corpus.BridgeToJson(norm)).Append('}');
+                    sb.Append("],\"bridge\":").Append(corpus.BridgeToJson(norm));
+                    // 再加一层：这次查询到底认出了哪些**处境**。bridge 是「词→标签」的
+                    // 展开，处境是它的值域去重；两者不是一回事 —— 一个处境可能由好几句
+                    // 原话共同触发。界面靠这个数说「你的话里有 3 个处境」，也靠它给每
+                    // 条结果标覆盖数。
+                    sb.Append(",\"concerns\":[");
+                    List<string> concerns = corpus.ConcernsOf(norm);
+                    for (int i = 0; i < concerns.Count; i++)
+                    {
+                        if (i > 0) sb.Append(',');
+                        sb.Append('"').Append(Json.Escape(concerns[i])).Append('"');
+                    }
+                    sb.Append("]}");
                     return sb.ToString();
                 }
                 catch (Exception ex)
@@ -2193,16 +2205,22 @@ namespace Jigu
             }
 
             _terms.Text = "检索：" + Corpus.Normalize(query) + "　命中 " + hits.Count + " 条";
+            // 内置界面只做**最小同步**：加一行覆盖数，不复刻网页那边的分组条。
+            // 它是网页起不来时的兜底路径，把处境分组整条搬过来只会多一处要维护的
+            // 重复实现，而这里的排版能力（TableLayoutPanel）也撑不起那条横向芯片条。
+            // 这是明确的取舍，不是漏做。
+            List<string> concerns = _corpus == null
+                ? new List<string>() : _corpus.ConcernsOf(Corpus.Normalize(query));
             int rank = 0;
             foreach (Corpus.SearchHit h in hits)
             {
                 rank++;
-                _list.Controls.Add(BuildCard(rank, h));
+                _list.Controls.Add(BuildCard(rank, h, concerns));
             }
             _list.ResumeLayout();
         }
 
-        private Control BuildCard(int rank, Corpus.SearchHit hit)
+        private Control BuildCard(int rank, Corpus.SearchHit hit, List<string> concerns)
         {
             CorpusDoc d = hit == null ? null : hit.Doc;
             int width = Math.Max(360, _list.ClientSize.Width - 76);
@@ -2285,6 +2303,18 @@ namespace Jigu
             // 明确的取舍，不是遗漏 —— 档位与判据照样显示，只是按相关度纵向排列。
             if (d != null && !string.IsNullOrEmpty(d.VerdictWhy))
                 AddField(grid, ref row, width, "判为", d.VerdictWhy, Color.FromArgb(110, 60, 50), false);
+            // 覆盖数：与网页那边同一个信号，只是这里只有一行字。覆盖 0 个、
+            // 或整句只认出一个处境时不显示 —— 那时它说明不了任何排序上的事。
+            if (concerns != null && concerns.Count > 1 && d != null && d.Themes != null)
+            {
+                int cov = 0;
+                for (int i = 0; i < concerns.Count; i++)
+                    if (Array.IndexOf(d.Themes, concerns[i]) >= 0) cov++;
+                if (cov > 0)
+                    AddField(grid, ref row, width, "占了处境",
+                        cov + " / " + concerns.Count + "（你的话里认出的处境里，它占了几个）",
+                        Color.FromArgb(192, 57, 43), false);
+            }
 
             card.Controls.Add(grid);
             return card;

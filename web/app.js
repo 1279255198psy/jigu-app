@@ -334,25 +334,47 @@
     return block("为什么给你看这条", ul);
   }
   // 处境识别条：摆在结果最前面，先说「我们听懂了什么」，再给史料。
-  // 全部命中都没有 why 时整条不出现，不留空壳。
-  function situationStrip(hits) {
-    var pairs = [], seen = {};
-    for (var i = 0; i < hits.length && pairs.length < 8; i++) {
+  //
+  // 按**处境**分组，不是平铺一堆词。这句区别是这张条存在的全部理由：平铺时
+  // 用户看到的是「命中了 7 个词」，分组后看到的才是「你这段话里有 3 个处境」。
+  // 处境在前（引擎给的 concerns，权威），触发它的原话在后做佐证。
+  //
+  // 原话来自各条命中的 why，而 why 每条上限 4 条，所以它未必覆盖全部处境 ——
+  // 没有佐证原话的处境只显示名字，不编一句用户没说过的话来凑。
+  // 一个处境都没有（也不在为什么里出现）时整条不出现，不留空壳。
+  function situationStrip(data, hits) {
+    var concerns = (data && data.concerns) || [];
+    var said = {}, extra = [];
+    for (var i = 0; i < hits.length; i++) {
       var why = hits[i].why || [];
-      for (var j = 0; j < why.length && pairs.length < 8; j++) {
-        var k = why[j].said + "\u0000" + why[j].label;
-        if (seen[k]) continue;
-        seen[k] = 1;
-        pairs.push(why[j]);
+      for (var j = 0; j < why.length; j++) {
+        var label = why[j].label, s = why[j].said;
+        if (!label || !s || s === label) continue;   // said == label 是同义反复，不是佐证
+        if (!said[label]) { said[label] = []; extra.push(label); }
+        if (said[label].indexOf(s) < 0 && said[label].length < 3) said[label].push(s);
       }
     }
-    if (!pairs.length) return null;
+    var labels = [];
+    for (var a = 0; a < concerns.length; a++)
+      if (labels.indexOf(concerns[a]) < 0) labels.push(concerns[a]);
+    for (var b = 0; b < extra.length; b++)
+      if (labels.indexOf(extra[b]) < 0) labels.push(extra[b]);
+    if (!labels.length) return null;
+
     var strip = el("div", "situation-strip");
-    strip.appendChild(el("span", "situation-lead", "你的描述里认出了："));
+    strip.appendChild(el("span", "situation-lead",
+      "你的描述里认出了 " + labels.length + " 个处境："));
     var chips = el("span", "chips inline");
-    for (var m = 0; m < pairs.length; m++) {
-      chips.appendChild(el("span", "chip chip-syn",
-        "「" + pairs[m].said + "」→ " + pairs[m].label));
+    for (var m = 0; m < labels.length; m++) {
+      var chip = el("span", "chip chip-syn");
+      chip.appendChild(el("em", null, labels[m]));
+      var quotes = said[labels[m]];
+      if (quotes && quotes.length) {
+        var parts = [];
+        for (var q = 0; q < quotes.length; q++) parts.push("「" + quotes[q] + "」");
+        chip.appendChild(el("i", null, "你说 " + parts.join("、")));
+      }
+      chips.appendChild(chip);
     }
     strip.appendChild(chips);
     return strip;
@@ -382,21 +404,34 @@
   // 所以「标注真跑起来」那天，界面不需要再改代码。
   function resultSlots(data) {
     var hits = (data && data.hits) ? data.hits : [];
+    // coverage 与 hits 同序（C# 侧 SearchToJson 一起吐出来的两数组）。
+    var coverage = (data && data.coverage) || [];
+    var concernTotal = ((data && data.concerns) || []).length;
     var slots = [], i;
     if (!(data && data.graded)) {
-      for (i = 0; i < hits.length; i++) slots.push({ hit: hits[i], badge: "#" + (i + 1), cls: "" });
+      for (i = 0; i < hits.length; i++)
+        slots.push({ hit: hits[i], badge: "#" + (i + 1), cls: "", at: i });
+      for (i = 0; i < slots.length; i++) {
+        slots[i].cov = typeof coverage[i] === "number" ? coverage[i] : -1;
+        slots[i].concernTotal = concernTotal;
+      }
       return slots;
     }
-    var byTier = {}, tiers = data.tiers || [];
+    var byTier = {}, at = {}, tiers = data.tiers || [];
     for (i = 0; i < tiers.length; i++) {
       var it = tiers[i];
       if (it && typeof it.hit === "number" && it.hit >= 0 && it.hit < hits.length) {
         byTier[it.verdict] = hits[it.hit];
+        at[it.verdict] = it.hit;
       }
     }
     for (i = 0; i < TIER_ORDER.length; i++) {
       var v = TIER_ORDER[i];
-      slots.push({ hit: byTier[v] || null, badge: TIER_TEXT[v], cls: TIER_CLASS[v], verdict: v });
+      var idx = at[v];
+      slots.push({ hit: byTier[v] || null, badge: TIER_TEXT[v], cls: TIER_CLASS[v],
+        verdict: v, at: idx,
+        cov: typeof coverage[idx] === "number" ? coverage[idx] : -1,
+        concernTotal: concernTotal });
     }
     return slots;
   }
@@ -421,6 +456,15 @@
     tb.appendChild(el("h3", null, hit.title || hit.chapter || "（无标题）"));
     tb.appendChild(el("p", "hit-sub", (hit.book || "史料") + "·" + (hit.chapter || "")));
     col.appendChild(tb);
+    // 覆盖说明：把排序依据摊开给用户看。这正是「结果意义不明」的解药 ——
+    // 一条史料凭什么排在这儿，答「它占了你说的 3 个处境里的 2 个」比答
+    // 「它的加权分是 7.27」有用得多。覆盖 0 个的不显示：那会变成一句
+    // 自曝其短的声明，而它出现在这里只是因为有档位要填。
+    // 只说得出 1 个处境的查询也不显示 —— 那时「1 个中的 1 个」不构成排序依据。
+    if (slot.cov > 0 && slot.concernTotal > 1) {
+      col.appendChild(el("p", "hit-coverage",
+        "这条史料占了你说的 " + slot.concernTotal + " 个处境中的 " + slot.cov + " 个"));
+    }
     // 档位判据只在有档位时才出现（没有标注的条目是空串）。
     if (hit.verdict && hit.verdictWhy) {
       col.appendChild(el("p", "plan-verdict-why",
@@ -499,7 +543,7 @@
     }
     head.appendChild(el("span", "hint", hint));
     box.appendChild(head);
-    var strip = situationStrip(hits);
+    var strip = situationStrip(data, hits);
     if (strip) box.appendChild(strip);
     var grid = el("div", "grid-3");
     var slots = resultSlots(data);
@@ -515,9 +559,36 @@
     box.appendChild(el("p", null, "词元（C# 生成）：" + ((data.terms && data.terms.length) ? data.terms.join("、") : "—")));
     var pairs = data.bridge || [];
     if (pairs.length) {
-      var list = [];
-      for (var i = 0; i < pairs.length; i++) list.push("「" + pairs[i].said + "」→ " + pairs[i].label);
-      box.appendChild(el("p", null, "系统把你的话理解成了：" + list.join("、")));
+      // 「观其解字之法」讲的是切词，这里补上它上面那一层：处境。
+      // 同一个平铺列表，按 label 归并之后才看得出「这不是 5 个词，是 2 个处境」。
+      var byLabel = [], idx = {};
+      for (var i = 0; i < pairs.length; i++) {
+        var lb = pairs[i].label;
+        if (idx[lb] === undefined) { idx[lb] = byLabel.length; byLabel.push({ label: lb, said: [] }); }
+        var g = byLabel[idx[lb]];
+        if (g.said.indexOf(pairs[i].said) < 0) g.said.push(pairs[i].said);
+      }
+      // 处境数以引擎的 concerns 为准（bridge 里可能少 —— 有的处境是标签名被
+      // 直接写中而触发的，那不产生 bridge 对，但确实是个处境）。
+      var concernList = data.concerns || [];
+      var total = concernList.length || byLabel.length;
+      // 按 concerns 的顺序摆，bridge 里多出来的（理论上有）缀在后面。
+      var ordered = [], seenLb = {};
+      for (var c1 = 0; c1 < concernList.length; c1++) {
+        seenLb[concernList[c1]] = 1;
+        for (var c2 = 0; c2 < byLabel.length; c2++)
+          if (byLabel[c2].label === concernList[c1]) ordered.push(byLabel[c2]);
+      }
+      for (var c3 = 0; c3 < byLabel.length; c3++)
+        if (!seenLb[byLabel[c3].label]) ordered.push(byLabel[c3]);
+      var parts = [];
+      for (var j = 0; j < ordered.length; j++) {
+        var g2 = ordered[j], qs = [];
+        for (var k = 0; k < g2.said.length; k++) qs.push("「" + g2.said[k] + "」");
+        parts.push(qs.length ? g2.label + "（你说 " + qs.join("、") + "）" : g2.label);
+      }
+      box.appendChild(el("p", null,
+        "系统把你的话理解成了 " + total + " 个处境：" + parts.join("；")));
     }
   }
 

@@ -35,9 +35,18 @@ test-gh/
 
 # tests\ 下手工 csc 编译出来的检查程序：只保留 .cs 源码
 tests/*.exe
+# tools\ 下同理：HtmlShot / label-audit 这些是手工 csc 编出来的，跑一次生成一次。
+# 与 tests\*.exe 是同一条规矩，只是目录不同。
+tools/*.exe
+tools/*/*.exe
 # 探针跑一次就重写一次的报告：是输出，不是源码。
 # 跟踪它们的代价是每跑一次探针工作区就脏一次，而 tools\release.ps1 会因此拒绝发布。
 tests/*-report.txt
+# tools\make-preview.ps1 生成的检索结果预览页（改动检索逻辑后出图核版式用）。
+# 同样是输出而非源码：每次跑都会重写，来源是当时的 hits.json 与语料。
+# 与下面 jigu-selfcheck.txt 一样，它是先以「基线快照」身份提交进来的，现已从索引里
+# 摘掉（文件仍在磁盘上）—— 需要基线时用 make-preview.ps1 重新生成即可，不缺这一份。
+tests/preview-ui.html
 # tests\ 下那几份 WebView2 DLL 是从 SDK 目录复制来的二进制，用于编译探针程序
 tests/Microsoft.Web.WebView2.*.dll
 tests/WebView2Loader.dll

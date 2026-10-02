@@ -80,6 +80,35 @@ namespace Jigu
         internal const int HighDf = 15;
 
         /// <summary>
+        /// 触发词匹配允许在相邻两个命中字之间夹几个字（可调）。
+        /// 用户不会照着 labels.json 的写法说话：「有人传话」他写成「有人不断传话」，
+        /// 「骨干想走」他写成「骨干已经想走了」。填充词现已由 StopWords.Mask 摘掉，
+        /// 这个预算留给摘不干净的那些（「想」这种既非停用词、又只是口气的字）。
+        ///
+        /// 为什么必须有上限、且**必须有序**：无预算的无序匹配会退化成「字符袋」，
+        /// 「团队」这类两字词就会到处命中 —— 那正是当初把它挡在门外的原因。
+        /// 上限 2 是保守起点，撤掉它的条件写在 docs 与本次改动的验收里：
+        /// 只要用例上出现一处不该有的桥接，就降回 0（只保留摘填充词）。
+        /// </summary>
+        internal const int TriggerGap = 2;
+
+        /// <summary>
+        /// 覆盖重排的入组门槛（可调）：一条史料要至少覆盖到这么多个本次查询的处境，
+        /// 才有资格被提前。只覆盖 1 个的不动 —— 否则「蹭上最泛的那个标签」也能被抬到
+        /// 前面，那又变成了「撞上一个词就赢」，正是这次要修的毛病。
+        ///
+        /// **只用于多处境查询。**单处境查询另有门槛，见 SearchSituated 里的 minCov：
+        /// 那里「覆盖 1 个」不是蹭标签，而是覆盖到了查询的**全部**处境，意义完全不同。
+        /// </summary>
+        internal const int MinCoverage = 2;
+
+        /// <summary>
+        /// 处境集合的上限（可调）。实测自然值是 1–4 个；上限只为兜底 ——
+        /// 一句很长的话可能触发一大片标签，那时「覆盖了几个」就不再是有效信号。
+        /// </summary>
+        internal const int MaxConcerns = 6;
+
+        /// <summary>
         /// 分词时「一个单字」的额外代价（可调）。单字几乎不会是用户想检索的词，
         /// 它在这里唯一的作用是让每个块都有解 —— 一个切不动的字不该让整块被丢弃，
         /// 那会连带丢掉块里真正的词。代价必须大到「两个单字」永远比不过「一个双字词」。
@@ -190,6 +219,9 @@ namespace Jigu
         {
             _labels = LabelTable.Load(baseDir);
             _stop = StopWords.Load(baseDir);
+            // 触发词匹配要拿停用词摘填充词（见 LabelTable.MatchingTriggers）。
+            // 必须在两张表都加载完之后调：各自 Load 一份会在两边漂移。
+            _labels.BindStopWords(_stop);
             string path = Path.Combine(baseDir, DataFileName);
             if (File.Exists(path))
             {
@@ -272,6 +304,7 @@ namespace Jigu
             // 同义词表与语料互不依赖，各自独立回落（外置文件 → 内嵌资源）
             if (_labels == null) _labels = LabelTable.Load(AppDomain.CurrentDomain.BaseDirectory);
             if (_stop == null) _stop = StopWords.Load(AppDomain.CurrentDomain.BaseDirectory);
+            _labels.BindStopWords(_stop);   // 同上：摘填充词要用的那一份词表
             lock (_gate)
             {
                 _docs.Clear();
@@ -527,6 +560,88 @@ namespace Jigu
         }
 
         /// <summary>
+        /// 这次查询**认出了哪些处境**，按 labels.json 里的顺序（稳定、可复现）。
+        /// 处境 = 真正被触发到的标签名。注意这里包含「用户自己打了标签名」那一种 ——
+        /// ExpandTraced 保留 said == label 的自匹配，而 BridgeToJson / BuildWhy 才过滤它，
+        /// 因为那两处的用途是「解释桥从哪来」，这里是「你这句话在说哪些处境」。
+        /// </summary>
+        internal List<string> ConcernsOf(string norm)
+        {
+            List<string> r = new List<string>(4);
+            if (_labels == null || string.IsNullOrEmpty(norm)) return r;
+            HashSet<string> hit = _labels.Expand(norm, _index);
+            if (hit.Count == 0) return r;
+            foreach (string name in _labels.Names())
+            {
+                if (!hit.Contains(name)) continue;
+                r.Add(name);
+                if (r.Count >= MaxConcerns) break;
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// 按**处境覆盖数**重排的一层包装。SearchScored 一行不改 ——
+        /// 它是共享的无分级评分路径（RunRankDiff / AnnoCheck / 内置兜底界面都在用）。
+        ///
+        /// 规则只有一条新排序键：
+        ///   覆盖 ≥ minCov 的条目排在最前（覆盖多的在前），
+        ///   其余按今天的原样跟在后面。
+        /// 覆盖数相同的条目之间，排序键完全回落到今天那套有效分 ——
+        /// 一个字节都不变。这是「粗标签负责对得上、细 themes 负责分得开」那条教训的防护：
+        /// 把 将帅不和 并成 内部矛盾 曾让 将相和 从 Top3 整个消失，覆盖重排不能重演它。
+        ///
+        /// 门槛**按处境数分档**（实测决定的，不是拍的）：
+        ///   · 多处境（≥2 个）：门槛 MinCoverage = 2。在 3 个处境里只蹭到最泛的那个，
+        ///     证据太弱 —— 这正是当初否掉「覆盖 1 个就提前」的理由。
+        ///   · 单处境：门槛 1。「覆盖 1 个」在这里不是蹭标签，而是覆盖到了查询的
+        ///     **全部**处境，意义完全不同。这一档原先整个退回 SearchScored，
+        ///     于是排序全由碰巧命中的泛词决定：C4「核心员工被竞争对手高薪挖走了」
+        ///     的实词几乎全不在索引里（员工/竞争/高薪/挖走 均 df=0），
+        ///     只剩 核心(df=4)、对手(df=7) 两个词在排序，正解排到了十名开外。
+        ///     降为 1 之后 萧何月下追韩信 升到第一。
+        /// 一个处境都没有时（concerns 为空）仍然退回 SearchScored ——「覆盖几个」
+        /// 那时才真的没有意义。
+        /// </summary>
+        internal List<SearchHit> SearchSituated(string query, int topK)
+        {
+            List<string> concerns = ConcernsOf(Normalize(query));
+            if (concerns.Count == 0) return SearchScored(query, topK);
+
+            // 池要开到全部命中：一条覆盖 3 个处境的史料完全可能靠纯分数排在很后面，
+            // 取个「够大」的常数就等于赌它不会掉出去。命中数本来就被语料规模限死，
+            // 全取的开销与 GradedPool 同量级。
+            List<SearchHit> pool = SearchScored(query, _docs.Count);
+
+            pool.Sort(delegate(SearchHit a, SearchHit b)
+            {
+                int ca = Coverage(a.Doc, concerns), cb = Coverage(b.Doc, concerns);
+                int mc = concerns.Count >= 2 ? MinCoverage : 1;
+                bool qa = ca >= mc, qb = cb >= mc;
+                if (qa != qb) return qa ? -1 : 1;
+                if (qa && ca != cb) return cb.CompareTo(ca);
+                int c = b.Score.CompareTo(a.Score);
+                if (c != 0) return c;
+                c = b.Terms.Count.CompareTo(a.Terms.Count);
+                if (c != 0) return c;
+                return a.Doc.No.CompareTo(b.Doc.No);
+            });
+
+            if (pool.Count > topK) pool.RemoveRange(topK, pool.Count - topK);
+            return pool;
+        }
+
+        /// <summary>这条史料的 themes 里命中了几个本次查询的处境。</summary>
+        private static int Coverage(CorpusDoc d, List<string> concerns)
+        {
+            if (d == null || d.Themes == null) return 0;
+            int n = 0;
+            for (int i = 0; i < concerns.Count; i++)
+                if (Array.IndexOf(d.Themes, concerns[i]) >= 0) n++;
+            return n;
+        }
+
+        /// <summary>
         /// 从这条命中的词元里挑出「为什么给你看这条」：某个词元是标签名，就说明
         /// 这条史料是靠挂在它身上的情境标签被找到的。
         ///
@@ -565,39 +680,43 @@ namespace Jigu
 
         /// <summary>
         /// 上/中/下分级选取：每档取最高分的那条，而不是笼统取分数前三。
-        /// 这是 SearchScored 之上的一层包装，不改 SearchScored 本身 ——
+        /// 这是 SearchSituated 之上的一层包装，不改 SearchScored 本身 ——
         /// 后者是「按分数排序」的评分对照路径，被自检的排序比对、AnnoCheck
         /// 和内置兜底界面共用，动它会同时改掉四处行为。
         ///
-        /// graded 为 false 表示「走了旧路径」，此时返回的与直接调 SearchScored 一致。
-        /// 语料里一条分级都没有时**必然**为 false —— 这是本功能在标注跑起来之前
-        /// 完全惰性的保证。
+        /// graded 为 false 表示「没走分档」，此时返回的是 SearchSituated 的结果
+        /// （单处境查询下与 SearchScored 逐条相同）。语料里一条分级都没有时**必然**
+        /// 为 false —— 这是分级功能在标注跑起来之前完全惰性的保证。
         /// </summary>
         internal List<SearchHit> SearchByVerdict(string query, int topK, out bool graded)
         {
             graded = false;
-            if (!_hasVerdicts) return SearchScored(query, topK);
+            if (!_hasVerdicts) return SearchSituated(query, topK);
 
             // 池必须开得比 topK 大：某一档的最佳代表本来可能排在第 40 名，
             // 只取前三就等于「在 Top3 里凑档位」，那和没改一样。
-            List<SearchHit> pool = SearchScored(query, GradedPool);
+            List<SearchHit> pool = SearchSituated(query, GradedPool);
             double top = 0;
             foreach (SearchHit h in pool) if (h.Score > top) top = h.Score;
-            if (top <= 0) return SearchScored(query, topK);
+            if (top <= 0) return SearchSituated(query, topK);
 
             double floor = top * VerdictFloorRatio;
             Dictionary<string, SearchHit> byTier =
                 new Dictionary<string, SearchHit>(StringComparer.Ordinal);
-            foreach (SearchHit h in pool)          // pool 已按有效分降序
+            foreach (SearchHit h in pool)
             {
-                if (h.Score < floor) break;        // 后面只会更小，可以停
+                // 不能 break。这里曾经写的是 break，理由是「pool 已按有效分降序，
+                // 后面只会更小」—— 那个前提在 SearchSituated 接入覆盖重排之后就没了：
+                // 池先按覆盖数排，高分条目完全可能排在低分条目**后面**。
+                // 早退会把它们整批切掉，实测表现为单处境查询放宽后 C3 由 3 条缩成 1 条。
+                if (h.Score < floor) continue;
                 string v = h.Doc == null ? "" : h.Doc.Verdict;
                 // 没档位的条目不能占档位；同档只留第一条（即最高分那条）
                 if (v.Length == 0 || byTier.ContainsKey(v)) continue;
                 byTier[v] = h;
             }
             // 一档都没选出来就退回旧路径 —— 宁可给不出三策，也不能返回空。
-            if (byTier.Count == 0) return SearchScored(query, topK);
+            if (byTier.Count == 0) return SearchSituated(query, topK);
 
             graded = true;
             List<SearchHit> picked = new List<SearchHit>(3);
@@ -836,6 +955,25 @@ namespace Jigu
             int withVerdict, cUp, cMid, cDown;
             VerdictStats(out withVerdict, out cUp, out cMid, out cDown);
             sb.Append(",\"verdictDocs\":").Append(withVerdict);
+            // 这次查询认出了哪些处境。界面靠它把「你的描述」分组说明、并给每条结果
+            // 标出「占了几个处境」—— 排序依据摊开给用户看，正是「意义不明」的解药。
+            // 加法：前端忽略未知键，老界面不受影响。
+            List<string> concerns = ConcernsOf(Normalize(query));
+            sb.Append(",\"concerns\":[");
+            for (int i = 0; i < concerns.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append('"').Append(Json.Escape(concerns[i])).Append('"');
+            }
+            sb.Append(']');
+            // 每条结果覆盖了几个处境，与 concerns 一一对应（同序）。
+            sb.Append(",\"coverage\":[");
+            for (int i = 0; i < hits.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append(Coverage(hits[i].Doc, concerns));
+            }
+            sb.Append(']');
             if (graded)
             {
                 sb.Append(",\"tiers\":[");
@@ -1002,7 +1140,8 @@ namespace Jigu
     /// 库里 5 条含「猜忌」的史料（陈平反间、沙丘之变、自毁长城…）一条没进。
     /// 这不是调参能修的：公式给「不断」高分是它的正确行为，错的是把无信息的词当成有信息的词。
     ///
-    /// 只作用于**查询侧**，不动索引，也不动同义词桥扩展出来的词。
+    /// 只作用于**查询侧**，不动索引；打分时也仍然只作用于查询词元。
+    /// 触发词匹配（LabelTable）另外用它做「填充词摘除」，见 Mask —— 那一步同样不改索引。
     /// 列表刻意保守：凡可能独立指代一种处境的词（不利 / 不足 / 不如 / 不能用其人…）一律不收。
     /// </summary>
     internal sealed class StopWords
@@ -1010,12 +1149,39 @@ namespace Jigu
         public const string FileName = "stopwords.json";
 
         private HashSet<string> _words;
+        /// <summary>同一批词，按长度倒序。Mask 必须长词优先，理由见 Mask 的注释。</summary>
+        private string[] _ordered;
 
         public int Count { get { return _words == null ? 0 : _words.Count; } }
 
         public bool Contains(string term)
         {
             return _words != null && term != null && _words.Contains(term);
+        }
+
+        /// <summary>
+        /// 把文本里出现过的停用词整段摘掉，返回剩下的「骨架」。
+        ///
+        /// 为什么需要它：触发词匹配本来要求用户一字不差连着写。实测 Q1
+        /// 「我和合伙人互相猜忌，团队里有人不断传话挑拨，骨干已经想走了」里，
+        /// 【谗言构陷】的触发词「有人传话」被 「有人**不断**传话」挡死 —— 而「不断」
+        /// 正是这张表自己认定「对想找什么相似情境毫无信息」的词。一边认定它无信息，
+        /// 一边让它挡死匹配，是这套停用词一直没被用对的地方。两侧都摘掉填充词再比，
+        /// 才是它该有的用法。
+        ///
+        /// **必须长词优先**：词表里既有「有人」也有「不断」，若先删短词，
+        /// 「有人不断」这串就不再连续，长词永远删不掉、留下残渣。
+        /// </summary>
+        public string Mask(string text)
+        {
+            if (_ordered == null || string.IsNullOrEmpty(text)) return text == null ? "" : text;
+            string s = text;
+            for (int i = 0; i < _ordered.Length; i++)
+            {
+                string w = _ordered[i];
+                if (s.IndexOf(w, StringComparison.Ordinal) >= 0) s = s.Replace(w, "");
+            }
+            return s;
         }
 
         public static StopWords Load(string baseDir)
@@ -1031,6 +1197,14 @@ namespace Jigu
                 string w = Convert.ToString(o);
                 if (!string.IsNullOrEmpty(w)) sw._words.Add(w);
             }
+            string[] ordered = new string[sw._words.Count];
+            sw._words.CopyTo(ordered);
+            Array.Sort(ordered, delegate(string a, string b)
+            {
+                int d = b.Length - a.Length;
+                return d != 0 ? d : string.CompareOrdinal(a, b);
+            });
+            sw._ordered = ordered;
             Log.Write("stopwords loaded: " + sw._words.Count + " words");
             return sw;
         }
@@ -1061,7 +1235,77 @@ namespace Jigu
         /// <summary>每条 = [标签名, trigger...]；标签名固定在索引 0</summary>
         private List<string[]> _entries;
 
+        /// <summary>
+        /// 与 _entries 一一对应的「摘掉停用词之后的触发词」。
+        /// 只在 BindStopWords 里建一次，不在每次检索时现算 —— 检索路径上
+        /// 每个标签每条触发词都要比一次，现算等于把 578 次字符串替换放进热路径。
+        /// </summary>
+        private List<string[]> _masked;
+
+        /// <summary>
+        /// 标签名 -> 准许放行的两字触发词（labels.json 的 short_triggers）。
+        /// 两字词不做间隔匹配（那会退化成字符袋），只在整句里字面出现才算命中，
+        /// 且必须在这张显式清单里 —— 清单由 tools 的指向性审计产出、人工过目，
+        /// 取代了原先「非标签名一律须 ≥3 字」的字数护栏。
+        /// </summary>
+        private Dictionary<string, HashSet<string>> _shortAllowed;
+
+        private StopWords _stop;
+
         public int LabelCount { get { return _entries == null ? 0 : _entries.Count; } }
+
+        /// <summary>放行的两字触发词数（体检用，便于看住那 177 个词的放行比例）</summary>
+        public int ShortTriggerCount
+        {
+            get
+            {
+                if (_shortAllowed == null) return 0;
+                int n = 0;
+                foreach (KeyValuePair<string, HashSet<string>> kv in _shortAllowed) n += kv.Value.Count;
+                return n;
+            }
+        }
+
+        /// <summary>
+        /// 把查询侧的停用词表交给标签表 —— 触发词匹配要拿它摘填充词。
+        /// 由 Corpus.LoadFrom 在两张表都加载完之后调一次，保证全程序只有一份词表：
+        /// 各自 Load 一份会在两边漂移，而漂移的后果是匹配口径悄悄不一致。
+        /// </summary>
+        public void BindStopWords(StopWords sw)
+        {
+            _stop = sw;
+            _masked = null;
+            if (_entries == null || _stop == null) return;
+            _masked = new List<string[]>(_entries.Count);
+            foreach (string[] e in _entries)
+            {
+                string[] m = new string[e.Length];
+                for (int i = 0; i < e.Length; i++) m[i] = _stop.Mask(e[i]);
+                _masked.Add(m);
+            }
+        }
+
+        /// <summary>查询句的骨架（摘掉停用词），与 _masked 里的触发词骨架同一套口径。</summary>
+        private string MaskNorm(string norm)
+        {
+            return _stop == null ? norm : _stop.Mask(norm);
+        }
+
+        /// <summary>
+        /// 第 k 条的触发词骨架。没绑过停用词表（单测直接 Load 的场合）时返回 null，
+        /// MatchingTriggers 会退回用触发词原样比较。
+        /// </summary>
+        private string[] EntryMasked(int k)
+        {
+            if (_masked == null || k >= _masked.Count) return null;
+            return _masked[k];
+        }
+
+        private bool ShortAllowed(string label, string trigger)
+        {
+            HashSet<string> set;
+            return _shortAllowed != null && _shortAllowed.TryGetValue(label, out set) && set.Contains(trigger);
+        }
 
         /// <summary>这个词是不是某个标签名（标签是粗层，打分要降权）</summary>
         public bool IsLabel(string term)
@@ -1124,8 +1368,34 @@ namespace Jigu
                     }
                 }
                 list.Add(one.ToArray());
+
+                // short_triggers 是 triggers 的**子集**（放行的两字词在 triggers 里原样留着，
+                // 只是另外列一遍）。不做成「把两字词从 triggers 里搬走」是有意的：
+                // tests/DataCheck.cs 按 triggers 的条数做断言，搬走会连它的计数一起改掉。
+                IList shortList = g["short_triggers"] as IList;
+                if (shortList != null)
+                {
+                    HashSet<string> set = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (object item in shortList)
+                    {
+                        string s = Convert.ToString(item);
+                        if (!string.IsNullOrEmpty(s)) set.Add(s);
+                    }
+                    if (set.Count > 0)
+                    {
+                        if (t._shortAllowed == null)
+                            t._shortAllowed = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+                        t._shortAllowed[name] = set;
+                    }
+                }
             }
             t._entries = list;
+            // 自带一份停用词表。LabelTable 会被独立使用（tests/TierCheck.cs 直接
+            // LabelTable.Load(dir) 之后调 Expand），这里不绑的话那条路径就是「不去填充词」
+            // 的，跟产品走的那条**静默分叉** —— 正是本文件注释里反复讲的「两套护栏漂移」。
+            // Corpus.LoadFrom 稍后会用自己那份 _stop 再 Bind 一次覆盖掉这里，所以产品里
+            // 全程序仍然只有一份词表；这里这次加载只为「独立使用」的那条路径兜底。
+            t.BindStopWords(StopWords.Load(baseDir));
             Log.Write("labels loaded: " + t.LabelCount + " labels, " + t.TriggerCount + " triggers");
             return t;
         }
@@ -1138,9 +1408,11 @@ namespace Jigu
             HashSet<string> sink = new HashSet<string>(StringComparer.Ordinal);
             if (_entries == null || string.IsNullOrEmpty(norm) || index == null) return sink;
 
-            foreach (string[] e in _entries)
+            string masked = MaskNorm(norm);
+            for (int k = 0; k < _entries.Count; k++)
             {
-                if (!Triggers(e, norm, index)) continue;
+                string[] e = _entries[k];
+                if (MatchingTriggers(e, EntryMasked(k), norm, masked, index).Count == 0) continue;
                 // 方案 B 的关键：并入标签名，而不是 trigger 本身。
                 // trigger 常常不在语料里（「留不住人」这类用户说法就是），并进去也匹配不到东西。
                 if (index.ContainsKey(e[0])) sink.Add(e[0]);
@@ -1161,9 +1433,11 @@ namespace Jigu
                 new Dictionary<string, List<string>>(StringComparer.Ordinal);
             if (_entries == null || string.IsNullOrEmpty(norm) || index == null) return sink;
 
-            foreach (string[] e in _entries)
+            string masked = MaskNorm(norm);
+            for (int k = 0; k < _entries.Count; k++)
             {
-                List<string> hits = MatchingTriggers(e, norm, index);
+                string[] e = _entries[k];
+                List<string> hits = MatchingTriggers(e, EntryMasked(k), norm, masked, index);
                 if (hits.Count == 0) continue;
                 if (!index.ContainsKey(e[0])) continue;
                 List<string> list;
@@ -1177,34 +1451,132 @@ namespace Jigu
             return sink;
         }
 
-        /// <summary>整句里字面出现任一 trigger（或标签名本身）即触发该标签。</summary>
-        private static bool Triggers(string[] e, string norm, Dictionary<string, List<int>> index)
-        {
-            return MatchingTriggers(e, norm, index).Count > 0;
-        }
-
         /// <summary>
-        /// 把 Triggers 的「命中即 true」拆成「命中了哪些 trigger」。护栏逐条照搬：
-        /// 索引 0 是标签名不受限；非标签名须 ≥3 字；已在索引里且 df 过高则不算触发器。
+        /// 命中了哪些 trigger。护栏分工：
+        ///   · 索引 0（标签名本身）—— 它是语料里真有的词，按原样精确匹配。不去填充词、
+        ///     不容许夹字：标签名是「史料挂的那套词」，桥的两个方向口径必须不一样。
+        ///   · 字面两字触发词 —— 只有在 short_triggers 的放行清单里才可能触发，
+        ///     清单由 tools/label-audit 按指向性算出（放行清单存在前一律不算）。
+        ///   · 长触发词 —— 在**摘掉填充词之后的骨架**上比，容忍夹 TriggerGap 个字；
+        ///     骨架自己若已在索引里且 df 超过 HighDf（泛词），退回字面匹配。
         /// Expand 与 ExpandTraced 共用这一个实现，避免两套护栏日后漂移。
         /// </summary>
-        private static List<string> MatchingTriggers(
-            string[] e, string norm, Dictionary<string, List<int>> index)
+        private List<string> MatchingTriggers(
+            string[] e, string[] me, string norm, string normMasked,
+            Dictionary<string, List<int>> index)
         {
             List<string> hits = new List<string>(2);
             for (int i = 0; i < e.Length; i++)
             {
                 string m = e[i];
                 if (string.IsNullOrEmpty(m)) continue;
-                if (i != 0)
+
+                if (i == 0)
                 {
-                    if (m.Length < 3) continue;
-                    List<int> posting;
-                    if (index.TryGetValue(m, out posting) && posting.Count > Corpus.HighDf) continue;
+                    if (Hit(m, norm)) hits.Add(m);
+                    continue;
                 }
-                if (norm.IndexOf(m, StringComparison.Ordinal) >= 0) hits.Add(m);
+
+                // 字面两字触发词。不管骨架：这类词本来就没有填充词可摘。
+                if (m.Length < 3)
+                {
+                    if (!ShortAllowed(e[0], m)) continue;
+                    List<int> p1;
+                    if (index.TryGetValue(m, out p1) && p1.Count > Corpus.HighDf) continue;
+                    if (Hit(m, normMasked)) hits.Add(m);
+                    continue;
+                }
+
+                string core = me == null ? m : me[i];
+
+                // 骨架太短或太泛，就**退回字面匹配** —— 也就是改造之前的行为。
+                // 这一步同时挡住两类险，两类都是实测出来的：
+                //   · 骨架不足两字：`打不过`→`打`、`怎么退`→`退`。一字骨架会到处命中，
+                //     但直接丢弃又会让这两个触发词**连照原样写都不再命中**（纯退步）。
+                //   · 骨架是语料里的泛词：`什么时候动手`→`动手`（df=21）、
+                //     `怎么用人`→`用人`（df=26）。护栏挂在原始触发词上时它们 df=0 一路
+                //     绿灯，挂在骨架上才挡得住。
+                // 退回字面不会漏掉「用户照原样写」的情形，所以整条是纯收紧，不是放宽。
+                bool gated = core.Length < 2;
+                if (!gated)
+                {
+                    List<int> p2;
+                    if (index.TryGetValue(core, out p2) && p2.Count > Corpus.HighDf) gated = true;
+                }
+                if (gated)
+                {
+                    if (Hit(m, norm)) hits.Add(m);
+                    continue;
+                }
+
+                // 摘掉填充词后跟标签名一字不差 —— 这个「说法」其实只是标签名加了点口气词
+                // （「怎么用人」→「用人」）。它不含任何新信息，而且照收会**编造引语**：
+                // 用户只打了「用人」，界面却会说「你说到『怎么用人』」。标签名本身由索引 0
+                // 那条原样匹配，所以这里跳过不会漏掉任何命中。
+                if (string.Equals(core, e[0], StringComparison.Ordinal)) continue;
+
+                // 两字骨架只认字面出现：不给它们间隔预算，否则「不听」这种会到处命中。
+                if (core.Length == 2)
+                {
+                    if (Hit(core, normMasked)) hits.Add(m);
+                    continue;
+                }
+                // 夹字匹配这一支**不做**否定判断：它没有单一命中位置（骨架的字是散开的），
+                // 「紧邻」无从谈起。宁可漏压，不可错压。
+                if (MatchesWithGap(core, normMasked)) hits.Add(m);
             }
             return hits;
+        }
+
+        /// <summary>
+        /// 字面命中：出现过就算，除非**每一处**出现都紧贴着一个否定词。
+        ///
+        /// 否定识别只做这一件事 —— **只压制，不反向加分**。没有反义表，
+        /// 凭空给反向标签加分等于编数据。
+        ///
+        /// 「紧邻」= 否定词在触发词**外面**且直接相邻。两点讲究：
+        ///   · 词内的否定不算：「不信任」的 不 在词里，它是触发词的一部分，
+        ///     照压会把 C17「他们并不信任对方」的【猜忌】压掉 —— 那是本规则的
+        ///     杀弃判据，压了 C17 掉回 0 个处境、直接变红。所以判据挂在
+        ///     「否定字符是否在 m 的起止之外」，不是「句子里有没有否定词」。
+        ///   · 隔字不压：「不…信任」这种中文歧义太大，只在直接相邻时才敢动手。
+        /// </summary>
+        private static bool Hit(string m, string hay)
+        {
+            int at = hay.IndexOf(m, StringComparison.Ordinal);
+            if (at < 0) return false;
+            while (at >= 0)
+            {
+                char before = at > 0 ? hay[at - 1] : '\0';
+                char after = at + m.Length < hay.Length ? hay[at + m.Length] : '\0';
+                if (!IsNegation(before) && !IsNegation(after)) return true;
+                at = hay.IndexOf(m, at + 1, StringComparison.Ordinal);
+            }
+            return false;
+        }
+
+        private static bool IsNegation(char ch)
+        {
+            return ch == '不' || ch == '没' || ch == '无' || ch == '别' || ch == '勿' || ch == '莫';
+        }
+
+        /// <summary>
+        /// core 的每个字按顺序出现在 hay 里，相邻两字之间合计最多夹 TriggerGap 个字。
+        /// **必须有序**：无序匹配会退化成「字符袋」，那正是当初把两字词全挡在门外的原因。
+        /// 累计跳过量即总跨度约束，不必再单独限跨度。
+        /// </summary>
+        private static bool MatchesWithGap(string core, string hay)
+        {
+            if (string.IsNullOrEmpty(core) || string.IsNullOrEmpty(hay)) return false;
+            int qi = 0, skipped = 0;
+            for (int k = 0; k < core.Length; k++)
+            {
+                int j = hay.IndexOf(core[k], qi);
+                if (j < 0) return false;
+                if (k > 0) skipped += j - qi;
+                qi = j + 1;
+            }
+            return skipped <= Corpus.TriggerGap;
         }
 
         /// <summary>

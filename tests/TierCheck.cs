@@ -78,12 +78,64 @@ internal static class TierCheck
                 if (byVerdict[i].Doc != byScore[i].Doc || byVerdict[i].Score != byScore[i].Score)
                 { same = false; break; }
             }
+        // 这条之所以还成立，是因为本夹具的查询用的是自造词，**一个处境都认不出来**
+        // （ConcernsOf == 0），于是 SearchSituated 原样退回 SearchScored。
+        // 认得出处境时排序就该变 —— 由下面 1b / 1c 两组反证盯着（多处境、单处境各一条）。
+        // 注意 2026-10 之后门槛按处境数分档，单处境查询也进覆盖重排，
+        // 所以这里的条件必须写成「一个都认不出」而不是「不足两个」。
         Check(same, "无分级语料上结果与 SearchScored 逐条相同（含分数）",
             "分级 " + byVerdict.Count + " 条 vs 直接 " + byScore.Count + " 条");
         int wv, up, mid, down;
         c0.VerdictStats(out wv, out up, out mid, out down);
         Check(wv == 0 && up == 0 && mid == 0 && down == 0, "无分级语料上 VerdictStats 全 0",
             "withVerdict=" + wv + " 上=" + up + " 中=" + mid + " 下=" + down);
+
+        // ---- 1b. 覆盖重排不是恒真死代码 ----
+        // 反证：认得出 ≥2 个处境时，排序**必须**与纯分数不同。
+        // 夹具刻意做成「只占一个处境的那条分数更高」：若覆盖键没生效，它还是第一。
+        string sitDir = MakeDir(resDir, "jigu-tier-situated");
+        File.WriteAllText(Path.Combine(sitDir, "corpus.json"), BuildSituatedFixture(),
+            new UTF8Encoding(false));
+        Corpus cSit = new Corpus();
+        cSit.LoadFrom(sitDir, null);
+        string sitQuery = "团队矛盾很深，互不信任";
+        List<string> concerns = cSit.ConcernsOf(Corpus.Normalize(sitQuery));
+        Check(concerns.Count >= 2, "「" + sitQuery + "」认得出 ≥2 个处境（反证的前提）",
+            "认出 " + concerns.Count + " 个: " + Join(new HashSet<string>(concerns)));
+        bool gradedSit;
+        List<Corpus.SearchHit> sit = cSit.SearchByVerdict(sitQuery, 3, out gradedSit);
+        List<Corpus.SearchHit> plainTop = cSit.SearchScored(sitQuery, 3);
+        Check(plainTop.Count > 0 && plainTop[0].Doc.Title == "只占猜忌且分高",
+            "纯分数下「只占一个处境」的那条排第一（反证的前提）",
+            "实际第一是 " + (plainTop.Count == 0 ? "无" : plainTop[0].Doc.Title));
+        Check(sit.Count > 0 && sit[0].Doc.Title == "两个处境都占",
+            "覆盖 ≥2 时「两个处境都占」的那条被提到第一（覆盖键真的在起作用）",
+            "实际第一是 " + (sit.Count == 0 ? "无" : sit[0].Doc.Title));
+        Directory.Delete(sitDir, true);
+
+        // ---- 1c. 单处境查询也要走覆盖重排 ----
+        // 2026-10 起门槛按处境数分档：多处境仍是 MinCoverage=2，单处境降为 1。
+        // 理由是「覆盖 1 个」在单处境下不是蹭标签，而是覆盖到了查询的**全部**处境。
+        // 同一条也要有反证：认得出 1 个处境时排序**必须**与纯分数不同。
+        string oneDir = MakeDir(resDir, "jigu-tier-one");
+        File.WriteAllText(Path.Combine(oneDir, "corpus.json"), BuildSingleConcernFixture(),
+            new UTF8Encoding(false));
+        Corpus cOne = new Corpus();
+        cOne.LoadFrom(oneDir, null);
+        string oneQuery = "团队矛盾很深";
+        List<string> oneConcerns = cOne.ConcernsOf(Corpus.Normalize(oneQuery));
+        Check(oneConcerns.Count == 1, "「" + oneQuery + "」只认得出 1 个处境（反证的前提）",
+            "认出 " + oneConcerns.Count + " 个: " + Join(new HashSet<string>(oneConcerns)));
+        bool gradedOne;
+        List<Corpus.SearchHit> oneSit = cOne.SearchByVerdict(oneQuery, 3, out gradedOne);
+        List<Corpus.SearchHit> onePlain = cOne.SearchScored(oneQuery, 3);
+        Check(onePlain.Count > 0 && onePlain[0].Doc.Title == "不占处境但纯分数高",
+            "纯分数下「不占处境」的那条排第一（反证的前提）",
+            "实际第一是 " + (onePlain.Count == 0 ? "无" : onePlain[0].Doc.Title));
+        Check(oneSit.Count > 0 && oneSit[0].Doc.Title == "占处境但纯分数低",
+            "单处境下覆盖到该处境的条目被提到第一（覆盖键在 |Q|==1 时也生效）",
+            "实际第一是 " + (oneSit.Count == 0 ? "无" : oneSit[0].Doc.Title));
+        Directory.Delete(oneDir, true);
 
         // ---- 2~5. 有分级的世界 ----
         string gradedDir = MakeDir(resDir, "jigu-tier-graded");
@@ -269,6 +321,37 @@ internal static class TierCheck
         FieldInfo f = typeof(Corpus).GetField("_index", BindingFlags.NonPublic | BindingFlags.Instance);
         if (f == null) throw new InvalidOperationException("Corpus._index 不在了，TierCheck 需要同步修改");
         return (Dictionary<string, List<int>>)f.GetValue(c);
+    }
+
+    /// <summary>
+    /// 覆盖重排的反证夹具。「只占猜忌且分高」的正文直接抄查询原话，于是它命中一堆
+    /// 用户自己打的词（不打折）；「两个处境都占」只挂着两个标签名，都是桥进来的
+    /// （打 0.75 折）。纯分数上前者赢 —— 覆盖键若失效，它就还是第一。
+    ///
+    /// 注意别用「塞一个查询里没有的稀有词」来拉分：那只抬高它的 idf，
+    /// 对本次查询一分不加（第一版夹具就是这么写错的，反证的前提当场没成立）。
+    /// </summary>
+    private static string BuildSituatedFixture()
+    {
+        return "{\"book\":\"覆盖夹具\",\"items\":["
+            + "{\"chapter\":\"甲\",\"title\":\"两个处境都占\",\"original\":\"阿尔法\"," +
+              "\"themes\":[\"猜忌\",\"内部矛盾\"]},"
+            + "{\"chapter\":\"甲\",\"title\":\"只占猜忌且分高\",\"original\":\"团队矛盾很深，互不信任\"," +
+              "\"themes\":[\"猜忌\"]}"
+            + "]}";
+    }
+
+    // 单处境夹具：查询「团队矛盾很深」只触发 内部矛盾 一个处境。
+    // 「不占处境」那条的原文就是查询本身，所以纯分数必然更高 ——
+    // 覆盖键若在单处境下没生效，它就会一直排第一，反证因此成立。
+    private static string BuildSingleConcernFixture()
+    {
+        return "{\"book\":\"单处境夹具\",\"items\":["
+            + "{\"chapter\":\"甲\",\"title\":\"占处境但纯分数低\",\"original\":\"伽马\"," +
+              "\"themes\":[\"内部矛盾\"]},"
+            + "{\"chapter\":\"乙\",\"title\":\"不占处境但纯分数高\",\"original\":\"团队矛盾很深\"," +
+              "\"themes\":[]}"
+            + "]}";
     }
 
     private static string MakeDir(string resDir, string name)
