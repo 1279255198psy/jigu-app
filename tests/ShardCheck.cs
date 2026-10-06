@@ -107,7 +107,7 @@ internal static class ShardCheck
         Console.WriteLine();
         Console.WriteLine("书名       条目数   正文字数  无译文   最短  中位   90分位   最长  最长译文  标签残留 乱码 生僻字  状态");
         Console.WriteLine("-----------------------------------------------------------------------------------------------------");
-        long totItems = 0, totChars = 0, totNoTrans = 0, totNav = 0, totOver = 0, maxOrig = 0, maxTrans = 0;
+        long totItems = 0, totChars = 0, totTransChars = 0, totNoTrans = 0, totNav = 0, totOver = 0, maxOrig = 0, maxTrans = 0;
         foreach (string[] m in _manifest)
         {
             string path = Path.Combine(shardDir, m[0] + ".json");
@@ -116,11 +116,12 @@ internal static class ShardCheck
             List<int> lens = new List<int>();
             List<int> tlens = new List<int>();
             int items = 0, noTrans = 0, html = 0, bad = 0, rare = 0, nav = 0, over = 0;
-            long chars = 0;
+            long chars = 0, tchars = 0;
             foreach (CorpusDoc d in ReadShard(path))
             {
                 items++;
                 chars += d.Original.Length;
+                tchars += (d.Translation ?? "").Length;
                 lens.Add(d.Original.Length);
                 if (string.IsNullOrEmpty(d.Translation)) noTrans++;
                 else tlens.Add(d.Translation.Length);
@@ -159,13 +160,17 @@ internal static class ShardCheck
                 + bad.ToString().PadLeft(4) + " "
                 + rare.ToString().PadLeft(6) + "  " + status);
 
-            totItems += items; totChars += chars; totNoTrans += noTrans;
+            totItems += items; totChars += chars; totTransChars += tchars; totNoTrans += noTrans;
             totNav += nav; totOver += over;
             if (mx > maxOrig) maxOrig = mx;
             if (tm > maxTrans) maxTrans = tm;
         }
         Console.WriteLine("--------------------------------------------------------------------------------------");
-        Console.WriteLine("合计 " + totItems + " 条，" + totChars + " 字，其中无译文 " + totNoTrans
+        // 原文与译文分开报，再给合计。FEATURES.md 里「二十四史共多少字」那个数就取自这里，
+        // 所以两者都印出来 —— 只印原文的话，照着文档那句「原文 + 白话译文」找不到出处。
+        // 译文会缺（无译文 N 条），缺的那部分按 0 计，所以合计是「实际有的字数」，不是满配。
+        Console.WriteLine("合计 " + totItems + " 条，原文 " + totChars + " 字 + 译文 " + totTransChars
+            + " 字 = " + (totChars + totTransChars) + " 字，其中无译文 " + totNoTrans
             + " 条（" + (totItems == 0 ? 0 : totNoTrans * 100 / totItems) + "%）");
         Console.WriteLine("最长正文 " + maxOrig + " 字，最长译文 " + maxTrans + " 字");
         // Phase 1 漏掉的两条：译文侧此前完全没有上限，实测最长一条 22,919 字（原文只剩 32 字的

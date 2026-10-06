@@ -18,7 +18,13 @@
 // 宁可少配也不错配：白话缺失或对不上的章，只出原文（translation 留空），
 // 由上层界面按既有逻辑降级显示。
 //
-// 用法：Convert24Histories.exe <上游根目录> <输出目录> [--only 史记,汉书]
+// 用法：Convert24Histories.exe <上游根目录> <输出目录> [--only 史记,汉书] [--manifest-only]
+//
+// --manifest-only 不转换任何东西，只按现有分片的**实际落盘大小**重算 index.json 的
+// bytes 列。存在的理由是标注（tools/annotate-shards）：标注把正文几乎翻倍，分片变大，
+// 而 index.json 是转换期写的，此后没人动它 —— 界面拿 bytes 折算「索引占用」显示在
+// 藏书阁里，于是标注过的书会低报约四成。重跑一次完整转换当然也能修好，但那会按上游
+// 重新生成分片，把标注整个冲掉。这个模式只读不写分片，专治这一种漂移。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -75,8 +81,16 @@ internal static class Convert24Histories
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
         if (args.Length < 2)
         {
-            Console.WriteLine("用法: Convert24Histories.exe <上游根目录> <输出目录> [--only 史记,汉书]");
+            Console.WriteLine("用法: Convert24Histories.exe <上游根目录> <输出目录> [--only 史记,汉书] [--manifest-only]");
             return 2;
+        }
+
+        // --manifest-only 只读分片，不读上游。位置参数形态保持不变（上游目录这一位会被忽略），
+        // 所以它必须排在上游目录的存在性校验之前 —— 否则在一个没有上游副本的机器上就跑不了，
+        // 而那正是这个模式想解决的场景：只拿到分片的人要修 bytes。
+        for (int i = 2; i < args.Length; i++)
+        {
+            if (args[i] == "--manifest-only") return ManifestOnly(args[1]);
         }
 
         string src = args[0];
@@ -891,6 +905,119 @@ internal static class Convert24Histories
         }
         sb.Append('"');
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// 只重算 index.json 的 bytes 列，其余（slug/book/dynasty/docs/chars/pairing）原样保留。
+    ///
+    /// 为什么不连 docs/chars 一起重算：标注只给分片**加字段**，original/translation 一字未动，
+    /// 所以条目数与正文字数是内容属性，不会漂；唯一随标注变的就是文件大小。而重算那两个
+    /// 得解析整份分片，这个工具是独立的、没带 JSON 解析器 —— 为一件不会发生的事引进一个
+    /// 解析器，正是「宁可少做也不错做」的反面。
+    ///
+    /// 行尾与缩进一律保持原样（原文件是 LF，由 WriteManifest 逐字符 '\n' 写出）：
+    /// 这里用 ReadAllLines + 手工补 '\n' 而不是 AppendLine，否则整份清单会被改写成 CRLF，
+    /// 光看 diff 会像是每一行都动过。
+    /// </summary>
+    private static int ManifestOnly(string outDir)
+    {
+        string indexPath = Path.Combine(outDir, "index.json");
+        if (!File.Exists(indexPath))
+        {
+            Console.WriteLine("FAIL: 找不到 " + indexPath);
+            Console.WriteLine("      --manifest-only 是在现有清单上重算数字，没有清单可改。先跑一次完整转换。");
+            return 1;
+        }
+
+        Console.WriteLine("清单: " + indexPath);
+        Console.WriteLine("模式: 只重算 bytes，分片只读不改");
+        Console.WriteLine();
+        Console.WriteLine("书名     落盘字节（清单 → 实际）                 变化");
+        Console.WriteLine("--------------------------------------------------------------------------");
+
+        string[] lines = File.ReadAllLines(indexPath, Encoding.UTF8);
+        StringBuilder outText = new StringBuilder();
+        int changed = 0, kept = 0, missing = 0;
+        HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string line in lines)
+        {
+            string slug = LineField(line, "slug");
+            // 表头、尾行 —— 不含 "slug" 的都不是书目行，原样抄。
+            if (slug.Length == 0) { outText.Append(line).Append('\n'); continue; }
+            seen.Add(slug);
+
+            int bi = line.IndexOf("\"bytes\":", StringComparison.Ordinal);
+            if (bi < 0) { outText.Append(line).Append('\n'); continue; }
+
+            string shard = Path.Combine(outDir, slug + ".json");
+            if (!File.Exists(shard))
+            {
+                Console.WriteLine(slug.PadRight(10) + "分片缺失，此行原样保留");
+                missing++;
+                outText.Append(line).Append('\n');
+                continue;
+            }
+
+            int vs = bi + "\"bytes\":".Length;
+            int ve = vs;
+            while (ve < line.Length && char.IsDigit(line[ve])) ve++;
+            long oldBytes = 0;
+            long.TryParse(line.Substring(vs, ve - vs), NumberStyles.Integer, CultureInfo.InvariantCulture, out oldBytes);
+            long newBytes = new FileInfo(shard).Length;
+
+            if (oldBytes == newBytes) { kept++; outText.Append(line).Append('\n'); continue; }
+
+            changed++;
+            Console.WriteLine(LineField(line, "book").PadRight(8)
+                + oldBytes.ToString().PadLeft(10) + " → " + newBytes.ToString().PadLeft(10)
+                + "   " + ((newBytes - oldBytes) * 100.0 / Math.Max(1, oldBytes)).ToString("+0.#;-0.#") + "%");
+            outText.Append(line, 0, vs).Append(newBytes.ToString(CultureInfo.InvariantCulture))
+                   .Append(line, ve, line.Length - ve).Append('\n');
+        }
+
+        // 分片在、清单里没有 —— 不算错，但要说出来：那种情况这一行永远不会被重算，
+        // 而症状与本次要修的漂移一模一样（界面里的数字对不上文件）。
+        int extra = 0;
+        foreach (string f in Directory.GetFiles(outDir, "*.json"))
+        {
+            string slug = Path.GetFileNameWithoutExtension(f);
+            if (string.Equals(slug, "index", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!seen.Contains(slug)) extra++;
+        }
+
+        Console.WriteLine("--------------------------------------------------------------------------");
+        if (changed == 0)
+        {
+            Console.WriteLine("没有需要改的：清单里的 bytes 与实际文件一致。");
+        }
+        else
+        {
+            File.WriteAllText(indexPath, outText.ToString(), new UTF8Encoding(false));
+            Console.WriteLine("已重算 " + changed + " 行，保持原样 " + kept + " 行。");
+        }
+        if (missing > 0) Console.WriteLine("警告: " + missing + " 行的分片文件不存在，那些行的数字无法核实。");
+        if (extra > 0) Console.WriteLine("警告: 输出目录里有 " + extra + " 个分片不在清单中，它们不会出现在藏书阁里。");
+        return 0;
+    }
+
+    /// <summary>
+    /// 从清单的一行里取出某个键的值。只认 WriteManifest 写出的固定形态（一行一条、
+    /// 键名带引号、字符串值不含转义引号），够用且不必为「读自己刚写的文件」引进解析器。
+    /// 找不到键返回空串。
+    /// </summary>
+    private static string LineField(string line, string key)
+    {
+        string pat = "\"" + key + "\":";
+        int i = line.IndexOf(pat, StringComparison.Ordinal);
+        if (i < 0) return "";
+        i += pat.Length;
+        if (i < line.Length && line[i] == '"')
+        {
+            int j = line.IndexOf('"', i + 1);
+            return j < 0 ? "" : line.Substring(i + 1, j - i - 1);
+        }
+        return "";   // 数字值这一版用不上，只收字符串键（slug / book）
     }
 
     private static void WriteManifest(string path, List<string[]> rows)

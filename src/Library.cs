@@ -4,8 +4,8 @@
 // 「装了什么」与「加载什么」是两件事：
 //   · 分片随安装包全部装进去（离线可用，不依赖任何网络），落在 <安装目录>\corpus\ 下，
 //     一部史书一个 JSON，外加一份 index.json 清单。
-//   · 只把勾选的几部读进内存。索引是常驻的，实测全量二十四史要约 1.4 GB ——
-//     默认全开不现实，所以默认只开精选 201 则 + 史记（约 100 MB）。
+//   · 只把勾选的几部读进内存。索引是常驻的，实测全量二十四史 1477 MB ——
+//     默认全开不现实，所以默认只开精选 201 则 + 史记（约 160 MB）。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -21,7 +21,10 @@ namespace Jigu
         public const string SelectionName = "library.json";
 
         /// <summary>
-        /// 装好之后的默认组合。史记覆盖先秦到汉武、题材最杂，实测索引约 100 MB。
+        /// 装好之后的默认组合。史记覆盖先秦到汉武、题材最杂，实测索引 163.7 MB。
+        /// 这个数在标注前后差很多（标注前 97.4 MB）：上中下三策那批标注给每条加了
+        /// 七个正文字段，分片正文几乎翻倍，索引随之上涨 —— 改这里之前先跑
+        /// tests\ShardCheck.exe --ram-default 实测，别按旧数往下减。
         /// 其余各史在藏书阁里勾选后按需载入（约 2–8 秒）。
         /// </summary>
         public static readonly string[] DefaultSelection = new string[] { "shiji" };

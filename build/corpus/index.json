@@ -2,10 +2,10 @@
   "note": "由 tools/convert-24histories 生成，勿手改",
   "source_url": "https://github.com/alephpi/24histories-simplified-chinese",
   "books": [
-    {"slug":"shiji", "book":"史记", "dynasty":"西汉", "docs":4866, "chars":617372, "bytes":5332394, "pairing":"段译配对"},
+    {"slug":"shiji", "book":"史记", "dynasty":"西汉", "docs":4866, "chars":617372, "bytes":9099677, "pairing":"段译配对"},
     {"slug":"hanshu", "book":"汉书", "dynasty":"东汉", "docs":6202, "chars":882643, "bytes":7192882, "pairing":"段译配对"},
     {"slug":"houhanshu", "book":"后汉书", "dynasty":"南朝宋", "docs":2441, "chars":752250, "bytes":4989959, "pairing":"整章对齐"},
-    {"slug":"sanguozhi", "book":"三国志", "dynasty":"西晋", "docs":2479, "chars":429678, "bytes":3625977, "pairing":"段译配对"},
+    {"slug":"sanguozhi", "book":"三国志", "dynasty":"西晋", "docs":2479, "chars":429678, "bytes":6055006, "pairing":"段译配对"},
     {"slug":"jinshu", "book":"晋书", "dynasty":"唐", "docs":3742, "chars":1158147, "bytes":6087200, "pairing":"部分对齐"},
     {"slug":"songshu", "book":"宋书", "dynasty":"南朝梁", "docs":1572, "chars":487823, "bytes":3351711, "pairing":"部分对齐"},
     {"slug":"nanqishu", "book":"南齐书", "dynasty":"南朝梁", "docs":406, "chars":126557, "bytes":900869, "pairing":"整章对齐"},

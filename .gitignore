@@ -15,6 +15,15 @@ src/InstallerPayload.g.cs
 # 而标注是打算一部一部做的，25 部就是 1 GB 永久压在 git 历史里。
 build/corpus.shards.zip
 
+# 标注（tools\annotate-shards）的中间产物，两者都是**可重建**的：
+#   annotations\     模型逐条返回的 jsonl。留着它是为了 --resume / --apply 不必重花钱，
+#                    但它是调用付费接口的中间记录，不是产品数据，不进版本库。
+#   corpus.annotated\ 回填后的分片副本，连没标注的那 23 部也整份抄了一遍（约 118 MB），
+#                    仓库里没有任何东西读它 —— build.ps1 只认 build\corpus。
+# 标注真正要进版本库的形态，就是 build\corpus\<slug>.json 本身（那一条没被忽略）。
+build/annotations/
+build/corpus.annotated/
+
 # 图标生成过程的中间渲染（tools\make-icon.ps1 的输出）。
 # 真正的资源是 resources\app.ico 与 resources\app.png，那两个要进版本库。
 tools/icon-tmp/

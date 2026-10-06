@@ -555,7 +555,7 @@ namespace Jigu
                 try
                 {
                     // 精选语料 + 藏书阁里勾选的史书分片。没勾的不读进来 —— 索引常驻，
-                    // 全量二十四史要约 1.4 GB，只能按需。
+                    // 全量二十四史 1477 MB，只能按需。
                     string corpusDir = AppDomain.CurrentDomain.BaseDirectory;
                     RebuildCorpus(Library.LoadSelection(corpusDir, null), false);
                     Log.Write("corpus ready: " + (_corpus == null ? 0 : _corpus.DocCount) + " docs, "
